@@ -1,0 +1,46 @@
+# ─────────────────────────────────────────────
+#  Jarvis Desktop — Electron UI + Python voice backend
+# ─────────────────────────────────────────────
+
+# Dependencies & build output
+node_modules/
+out/
+dist/
+release/
+.vite/
+
+# Secrets — never commit
+.env
+backend/.env
+*.pem
+*.key
+
+# Python backend
+backend/.venv/
+backend/venv/
+backend/env/
+backend/runtime/
+backend/__pycache__/
+backend/**/__pycache__/
+backend/*.py[cod]
+backend/.uv-cache/
+backend/logs/
+backend/models/
+backend/build/
+backend/*.spec
+
+# Jarvis persistent data (PERSONAL — memory, encrypted email store, cache). NEVER commit.
+backend/data/
+
+# Local throwaway verification / scratch scripts
+backend/scratchpad/
+
+# OS & IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Logs
+*.log
+npm-debug.log*
