@@ -11,6 +11,7 @@ export default defineConfig({
     plugins: [externalizeDepsPlugin()]
   },
   renderer: {
+    publicDir: resolve('public'),
     resolve: {
       alias: {
         '@': resolve('src')

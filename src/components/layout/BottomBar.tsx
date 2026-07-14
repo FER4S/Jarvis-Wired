@@ -8,7 +8,7 @@ interface BottomBarProps {
 
 export function BottomBar({ voiceState }: BottomBarProps) {
   return (
-    <footer className="relative shrink-0 px-5 py-4 border-t border-[var(--border)] bg-[rgba(7,11,18,0.75)] backdrop-blur-md">
+    <footer className="relative shrink-0 z-20 pt-2 bg-transparent">
       <ContactEmailPrompt />
       <TalkToJarvisBar state={voiceState} />
     </footer>

@@ -1,4 +1,10 @@
 import type { VoiceState } from './types'
+import type {
+  EmailAccount,
+  EmailSummaryResponse,
+  GmailOAuthUrlResponse,
+  ImapAccountRequest
+} from './types'
 
 export type JarvisEventType =
   | 'wake_word_detected'
@@ -31,11 +37,35 @@ export interface HealthResponse {
 export interface StatusResponse {
   running: boolean
   state: string
+  error?: string | null
+}
+
+const STORAGE_URL_KEY = 'jarvis_api_url'
+const STORAGE_TOKEN_KEY = 'jarvis_api_token'
+
+export function getStoredApiUrl(): string | null {
+  return localStorage.getItem(STORAGE_URL_KEY)
+}
+
+export function getStoredToken(): string | null {
+  return localStorage.getItem(STORAGE_TOKEN_KEY)
+}
+
+export function setStoredCredentials(apiUrl: string, token: string): void {
+  localStorage.setItem(STORAGE_URL_KEY, apiUrl.replace(/\/$/, ''))
+  localStorage.setItem(STORAGE_TOKEN_KEY, token)
+}
+
+export function clearStoredCredentials(): void {
+  localStorage.removeItem(STORAGE_URL_KEY)
+  localStorage.removeItem(STORAGE_TOKEN_KEY)
 }
 
 export function getApiBaseUrl(): string {
+  const stored = getStoredApiUrl()
+  if (stored) return stored
   if (import.meta.env.VITE_API_BASE_URL) {
-    return import.meta.env.VITE_API_BASE_URL.replace(/\/$/, '')
+    return (import.meta.env.VITE_API_BASE_URL as string).replace(/\/$/, '')
   }
   if (window.jarvis?.backend?.url) {
     return window.jarvis.backend.url.replace(/\/$/, '')
@@ -44,6 +74,8 @@ export function getApiBaseUrl(): string {
 }
 
 export function getToken(): string {
+  const stored = getStoredToken()
+  if (stored) return stored
   if (import.meta.env.VITE_JARVIS_TOKEN) {
     return import.meta.env.VITE_JARVIS_TOKEN as string
   }
@@ -60,6 +92,16 @@ export function getWsUrl(): string {
   const wsBase = base.replace(/^http/, 'ws') + '/events'
   const token = getToken()
   return token ? `${wsBase}?token=${encodeURIComponent(token)}` : wsBase
+}
+
+async function parseErrorDetail(res: Response, fallback: string): Promise<string> {
+  try {
+    const data = await res.json()
+    if (data?.detail) return typeof data.detail === 'string' ? data.detail : fallback
+  } catch {
+    // non-JSON body
+  }
+  return fallback
 }
 
 export function mapBackendState(state: string): VoiceState {
@@ -138,6 +180,18 @@ class BackendClient {
     return res.json()
   }
 
+  async validateToken(apiUrl: string, token: string): Promise<void> {
+    const base = apiUrl.replace(/\/$/, '')
+    const healthRes = await fetch(`${base}/health`)
+    if (!healthRes.ok) throw new Error('Backend unreachable — check the URL.')
+
+    const res = await fetch(`${base}/email/accounts`, {
+      headers: { Authorization: `Bearer ${token}` }
+    })
+    if (res.status === 401) throw new Error('Invalid API token.')
+    if (!res.ok) throw new Error(`Auth check failed: ${res.status}`)
+  }
+
   async start(): Promise<{ status: string }> {
     const res = await fetch(`${getApiBaseUrl()}/start`, { method: 'POST', headers: authHeaders() })
     if (!res.ok) throw new Error(`Start failed: ${res.status}`)
@@ -150,7 +204,46 @@ class BackendClient {
     return res.json()
   }
 
-  /** Submit a typed recipient address to fulfil an open contact request. */
+  async listEmailAccounts(): Promise<EmailAccount[]> {
+    const res = await fetch(`${getApiBaseUrl()}/email/accounts`, { headers: authHeaders() })
+    if (!res.ok) throw new Error(await parseErrorDetail(res, `Failed to list accounts: ${res.status}`))
+    const data = await res.json()
+    return data.accounts ?? []
+  }
+
+  async addImapAccount(body: ImapAccountRequest): Promise<EmailAccount> {
+    const res = await fetch(`${getApiBaseUrl()}/email/accounts/imap`, {
+      method: 'POST',
+      headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    })
+    if (!res.ok) throw new Error(await parseErrorDetail(res, `Failed to add account: ${res.status}`))
+    const data = await res.json()
+    return data.account
+  }
+
+  async getGmailOAuthUrl(): Promise<GmailOAuthUrlResponse> {
+    const res = await fetch(`${getApiBaseUrl()}/email/accounts/gmail/oauth-url`, {
+      headers: authHeaders()
+    })
+    if (!res.ok) throw new Error(await parseErrorDetail(res, `Gmail OAuth failed: ${res.status}`))
+    return res.json()
+  }
+
+  async deleteEmailAccount(id: string): Promise<void> {
+    const res = await fetch(`${getApiBaseUrl()}/email/accounts/${id}`, {
+      method: 'DELETE',
+      headers: authHeaders()
+    })
+    if (!res.ok) throw new Error(await parseErrorDetail(res, `Failed to delete account: ${res.status}`))
+  }
+
+  async getEmailSummary(): Promise<EmailSummaryResponse> {
+    const res = await fetch(`${getApiBaseUrl()}/email/summary`, { headers: authHeaders() })
+    if (!res.ok) throw new Error(await parseErrorDetail(res, `Failed to fetch summary: ${res.status}`))
+    return res.json()
+  }
+
   async submitContactEmail(email: string): Promise<void> {
     const res = await fetch(`${getApiBaseUrl()}/email/pending-contact`, {
       method: 'POST',
@@ -158,18 +251,10 @@ class BackendClient {
       body: JSON.stringify({ email })
     })
     if (!res.ok) {
-      let detail = `Request failed: ${res.status}`
-      try {
-        const data = await res.json()
-        if (data?.detail) detail = data.detail
-      } catch {
-        // non-JSON error body — keep the generic message
-      }
-      throw new Error(detail)
+      throw new Error(await parseErrorDetail(res, `Request failed: ${res.status}`))
     }
   }
 
-  /** Whether the voice flow is currently waiting for a recipient's address (reconnect resilience). */
   async getPendingContact(): Promise<{ name: string } | null> {
     const res = await fetch(`${getApiBaseUrl()}/email/pending-contact`, { headers: authHeaders() })
     if (!res.ok) return null

@@ -6,30 +6,22 @@ export function WindowControls() {
   const close = () => window.jarvis?.window?.close()
 
   const btn =
-    'w-8 h-8 flex items-center justify-center rounded-md text-[var(--text-meta)] transition-colors'
+    'w-8 h-8 flex items-center justify-center t-btn t-surface t-text transition-all hover:-translate-y-px'
 
   return (
-    <div className="flex items-center gap-0.5 no-drag">
-      <button
-        onClick={minimize}
-        className={`${btn} hover:bg-[var(--bg-surface-hover)] hover:text-[var(--text-primary)]`}
-        aria-label="Minimize"
-      >
-        <Minus size={14} strokeWidth={2} />
+    <div className="flex items-center gap-2 no-drag">
+      <button onClick={minimize} className={btn} aria-label="Minimize">
+        <Minus size={14} strokeWidth={3} />
       </button>
-      <button
-        onClick={maximize}
-        className={`${btn} hover:bg-[var(--bg-surface-hover)] hover:text-[var(--text-primary)]`}
-        aria-label="Maximize"
-      >
-        <Square size={11} strokeWidth={2} />
+      <button onClick={maximize} className={btn} aria-label="Maximize">
+        <Square size={11} strokeWidth={3} />
       </button>
       <button
         onClick={close}
-        className={`${btn} hover:bg-[rgba(248,113,113,0.15)] hover:text-[var(--red)]`}
+        className="w-8 h-8 flex items-center justify-center t-btn bg-rose-500 text-black transition-all hover:-translate-y-px"
         aria-label="Close"
       >
-        <X size={14} strokeWidth={2} />
+        <X size={14} strokeWidth={3} />
       </button>
     </div>
   )

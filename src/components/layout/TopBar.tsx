@@ -1,58 +1,60 @@
+import { NavLink } from 'react-router-dom'
 import { WindowControls } from '@/components/layout/WindowControls'
 import { useBackend } from '@/context/BackendContext'
-import { useClock } from '@/hooks/useClock'
-import { Cpu } from 'lucide-react'
+
+const navLinks = [
+  { to: '/', label: 'Command', end: true },
+  { to: '/email', label: 'Email' },
+  { to: '/system', label: 'System' },
+  { to: '/account', label: 'Account' }
+] as const
 
 export function TopBar() {
-  const { connected, reconnecting, running, voiceState } = useBackend()
-  const { time, date } = useClock()
-
-  const statusKey = connected ? 'online' : reconnecting ? 'warning' : 'offline'
-  const statusLabel = connected
-    ? running
-      ? voiceState.replace('_', ' ')
-      : 'Standby'
-    : reconnecting
-      ? 'Reconnecting'
-      : 'Offline'
+  const { connected } = useBackend()
 
   return (
-    <header className="relative h-12 shrink-0 flex items-center justify-between px-5 border-b border-[var(--border)] bg-[rgba(7,11,18,0.6)] backdrop-blur-md drag-region">
-      <div className="flex items-center gap-5 no-drag">
-        <div className="flex items-center gap-3">
-          <div className="flex h-8 w-8 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--bg-surface)]">
-            <Cpu size={16} className="text-[var(--cyan)]" strokeWidth={1.75} />
+    <header className="relative shrink-0 flex items-center justify-between gap-4 px-4 py-3 t-elevated drag-region">
+      <div className="flex items-center gap-5 no-drag min-w-0">
+        <div className="flex items-center gap-3 shrink-0">
+          <div className="w-8 h-8 t-accent-mark flex items-center justify-center">
+            <span className="font-mono text-xs font-bold">J</span>
           </div>
-          <div>
-            <h1 className="font-orbitron text-sm font-bold tracking-[0.2em] text-[var(--text-primary)] leading-none">
-              JARVIS
-            </h1>
-            <p className="text-[10px] text-[var(--text-meta)] mt-0.5 tracking-wide">
+          <div className="hidden sm:block">
+            <p className="font-sans text-sm font-semibold t-text leading-none">Jarvis</p>
+            <p className="font-mono text-[9px] t-text-muted uppercase tracking-wider mt-0.5">
               Command Center
             </p>
           </div>
         </div>
 
-        <div className="hidden md:block h-6 w-px bg-[var(--border)]" />
-
-        <span className={`status-pill status-pill--${statusKey}`}>
-          <span
-            className={`w-1.5 h-1.5 rounded-full ${
-              statusKey === 'online'
-                ? 'bg-[var(--green)]'
-                : statusKey === 'warning'
-                  ? 'bg-[var(--yellow)]'
-                  : 'bg-[var(--red)]'
-            } ${connected ? 'pulse-dot' : ''}`}
-          />
-          <span className="capitalize">{statusLabel}</span>
-        </span>
+        <nav className="flex items-center gap-1.5 overflow-x-auto">
+          {navLinks.map(({ to, label, end }) => (
+            <NavLink
+              key={to}
+              to={to}
+              end={end}
+              className={({ isActive }) =>
+                `px-3 py-1.5 font-mono text-[10px] uppercase tracking-wide whitespace-nowrap transition-colors ${
+                  isActive
+                    ? 't-nav-active font-bold'
+                    : 't-nav-inactive font-medium'
+                }`
+              }
+            >
+              {label}
+            </NavLink>
+          ))}
+        </nav>
       </div>
 
-      <div className="flex items-center gap-4 no-drag">
-        <div className="hidden sm:block text-right">
-          <p className="font-mono-hud text-xs font-medium text-[var(--text-primary)]">{time}</p>
-          <p className="text-[10px] text-[var(--text-meta)]">{date}</p>
+      <div className="flex items-center gap-3 no-drag shrink-0">
+        <div className="hidden md:flex items-center gap-2 px-2.5 py-1 t-surface border">
+          <span
+            className={`w-2 h-2 rounded-full ${connected ? 'bg-emerald-400' : 'bg-rose-500 animate-pulse'}`}
+          />
+          <span className="font-mono text-[9px] uppercase t-text-muted">
+            {connected ? 'Live' : 'Offline'}
+          </span>
         </div>
         <WindowControls />
       </div>

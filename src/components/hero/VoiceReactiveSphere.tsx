@@ -7,6 +7,7 @@ import type { VoiceState } from '@/services/types'
 import { useVoiceAmplitude } from '@/hooks/useVoiceAmplitude'
 import { useVoiceState } from '@/hooks/useVoiceState'
 import { useBackend } from '@/context/BackendContext'
+import { useTheme } from '@/context/ThemeContext'
 
 const SHELL_RADIUS = 1.18
 const GRID_W = 112
@@ -89,10 +90,10 @@ const shellVertexShader = /* glsl */ `
   }
 
   vec3 gradientColor(float t) {
-    vec3 bottom = vec3(1.0, 0.18, 0.02);
-    vec3 midLow = vec3(0.82, 0.06, 0.48);
-    vec3 mid = vec3(0.35, 0.02, 0.78);
-    vec3 top = vec3(0.05, 0.78, 1.0);
+    vec3 bottom = vec3(1.0, 0.45, 0.05);
+    vec3 midLow = vec3(0.95, 0.15, 0.55);
+    vec3 mid = vec3(0.65, 0.08, 0.72);
+    vec3 top = vec3(0.42, 0.05, 0.88);
     if (t < 0.30) return mix(bottom, midLow, t / 0.30);
     if (t < 0.58) return mix(midLow, mid, (t - 0.30) / 0.28);
     return mix(mid, top, (t - 0.58) / 0.42);
@@ -122,9 +123,9 @@ const shellVertexShader = /* glsl */ `
     float heightT = clamp(normalize(pos).y * 0.5 + 0.5, 0.0, 1.0);
     vec3 baseColor = gradientColor(heightT);
 
-    vec3 listenTint = vec3(0.05, 0.35, 0.28);
-    vec3 processTint = vec3(0.45, 0.28, 0.0);
-    vec3 speakTint = vec3(0.28, 0.05, 0.45);
+    vec3 listenTint = vec3(0.15, 0.85, 0.35);
+    vec3 processTint = vec3(0.05, 0.75, 0.85);
+    vec3 speakTint = vec3(0.92, 0.15, 0.58);
     if (uState > 0.5 && uState < 1.5) baseColor = mix(baseColor, listenTint, 0.35 + uAmplitude * 0.25);
     if (uState > 1.5 && uState < 2.5) baseColor = mix(baseColor, processTint, 0.4 + sin(uTime * 6.0) * 0.15);
     if (uState > 2.5) baseColor = mix(baseColor, speakTint, 0.3 + uAmplitude * 0.35);
@@ -303,18 +304,20 @@ function DustSphere({
 function Scene({
   amplitude,
   voiceState,
-  connected
+  connected,
+  canvasBg
 }: {
   amplitude: number
   voiceState: VoiceState
   connected: boolean
+  canvasBg: string
 }) {
   const autoRotateSpeed =
     voiceState === 'processing' ? 0.22 : voiceState === 'listening' ? 0.16 : 0.08 + amplitude * 0.12
 
   return (
     <>
-      <color attach="background" args={['#000000']} />
+      <color attach="background" args={[canvasBg]} />
       <DustSphere amplitude={amplitude} voiceState={voiceState} connected={connected} />
       <OrbitControls enableZoom={false} enablePan={false} autoRotate autoRotateSpeed={autoRotateSpeed} />
     </>
@@ -332,24 +335,27 @@ export function VoiceReactiveSphere() {
   const amplitude = useVoiceAmplitude()
   const voiceState = useVoiceState()
   const { connected } = useBackend()
+  const { isLight } = useTheme()
+  const canvasBg = isLight ? '#f3f4f8' : '#000000'
 
   return (
-    <div className="relative h-full w-full min-h-0 bg-black">
+    <div
+      className="relative flex-1 min-h-0 w-full"
+      style={{ backgroundColor: 'var(--theme-canvas-bg)' }}
+    >
       <div className="absolute inset-x-0 top-3 z-10 flex justify-center pointer-events-none">
         <span
-          className="font-mono-hud text-[9px] tracking-[0.25em] uppercase transition-colors duration-300"
-          style={{
-            color:
-              voiceState === 'listening'
-                ? '#34d399'
+          className={`font-mono text-[10px] font-bold tracking-widest uppercase px-3 py-1 border-2 border-black shadow-[3px_3px_0px_0px_black] ${
+            !connected
+              ? 'bg-rose-500 text-black'
+              : voiceState === 'listening'
+                ? 'bg-green-500 text-black'
                 : voiceState === 'processing'
-                  ? '#fbbf24'
+                  ? 'bg-cyan-500 text-black'
                   : voiceState === 'speaking'
-                    ? '#a78bfa'
-                    : connected
-                      ? '#38bdf8'
-                      : '#475569'
-          }}
+                    ? 'bg-pink-500 text-white'
+                    : 'bg-yellow-400 text-black'
+          }`}
         >
           {connected ? STATE_LABEL[voiceState] : 'Offline'}
         </span>
@@ -357,10 +363,11 @@ export function VoiceReactiveSphere() {
       <Canvas
         dpr={[1, 2]}
         camera={{ position: [0, 0.1, 5.4], fov: 38 }}
-        style={{ width: '100%', height: '100%' }}
+        className="absolute inset-0"
+        style={{ width: '100%', height: '100%', display: 'block' }}
         gl={{ alpha: false, antialias: true }}
       >
-        <Scene amplitude={amplitude} voiceState={voiceState} connected={connected} />
+        <Scene amplitude={amplitude} voiceState={voiceState} connected={connected} canvasBg={canvasBg} />
       </Canvas>
     </div>
   )

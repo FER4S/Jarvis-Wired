@@ -7,15 +7,19 @@
     "dev": "electron-vite dev",
     "build": "electron-vite build",
     "preview": "electron-vite preview",
+    "generate:ai-core": "node scripts/generate-ai-core-glb.mjs",
     "dist": "npm run build && electron-builder --win"
   },
   "dependencies": {
     "@react-three/drei": "^10.0.6",
     "@react-three/fiber": "^9.1.2",
+    "@react-three/postprocessing": "^3.0.4",
     "framer-motion": "^12.6.3",
     "lucide-react": "^0.487.0",
+    "postprocessing": "^6.39.2",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
+    "react-router-dom": "^7.18.1",
     "recharts": "^2.15.2",
     "three": "^0.175.0"
   },

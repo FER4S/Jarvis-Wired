@@ -51,6 +51,7 @@ interface BackendContextValue {
 const BackendContext = createContext<BackendContextValue | null>(null)
 
 const MAX_EVENTS = 20
+const MAX_TRANSCRIPT = 2
 
 function formatEventLabel(event: JarvisBackendEvent): string {
   switch (event.event) {
@@ -123,7 +124,7 @@ export function BackendProvider({ children }: { children: ReactNode }) {
             text: event.text!,
             timestamp: new Date()
           }
-        ])
+        ].slice(-MAX_TRANSCRIPT))
       }
 
       if (event.event === 'llm_response' && event.text) {
@@ -135,7 +136,7 @@ export function BackendProvider({ children }: { children: ReactNode }) {
             text: event.text!,
             timestamp: new Date()
           }
-        ])
+        ].slice(-MAX_TRANSCRIPT))
       }
 
       if (event.event === 'models_ready') {

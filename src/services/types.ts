@@ -74,6 +74,54 @@ export interface EmailItem {
   starred?: boolean
 }
 
+export interface EmailAccount {
+  id: string
+  label: string
+  provider: 'imap' | 'gmail_oauth'
+  created_at: string
+}
+
+export interface EmailRecentItem {
+  subject: string
+  sender_name: string
+  sender_email: string
+  date: string
+  unread: boolean
+  snippet: string
+}
+
+export interface EmailSummaryAccount {
+  id: string
+  label: string
+  provider: 'imap' | 'gmail_oauth'
+  unread_count: number
+  last_poll: string | null
+  last_error: string | null
+  recent: EmailRecentItem[]
+}
+
+export interface EmailSummaryResponse {
+  accounts: EmailSummaryAccount[]
+  total_unread: number
+}
+
+export interface ImapAccountRequest {
+  label: string
+  host: string
+  port: number
+  username: string
+  password: string
+  use_ssl?: boolean
+  smtp_host?: string
+  smtp_port?: number
+  smtp_use_ssl?: boolean
+}
+
+export interface GmailOAuthUrlResponse {
+  url: string
+  expires_in: number
+}
+
 export interface Agent {
   id: string
   name: string
