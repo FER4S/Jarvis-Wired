@@ -208,6 +208,15 @@ declare global {
         maximize: () => void
         close: () => void
       }
+      setup?: {
+        status: () => Promise<{ needed: boolean }>
+        begin: () => void
+        retry: () => void
+        onProgress: (cb: (p: { pct: number; phase: string; detail: string }) => void) => () => void
+        onLog: (cb: (line: string) => void) => () => void
+        onDone: (cb: () => void) => () => void
+        onError: (cb: (e: { message: string }) => void) => () => void
+      }
     }
   }
 }

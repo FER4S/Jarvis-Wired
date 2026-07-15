@@ -12,90 +12,140 @@ const BACKEND_PORT = new URL(BACKEND_URL).port || '8000'
 const BACKEND_TOKEN = randomBytes(32).toString('hex')
 
 let backendProcess: ChildProcess | null = null
+let provisionProcess: ChildProcess | null = null
+let mainWindow: BrowserWindow | null = null
+
+function backendRoot(): string {
+  return app.isPackaged ? join(process.resourcesPath, 'backend') : join(app.getAppPath(), 'backend')
+}
+
+function runtimePython(): string {
+  const root = backendRoot()
+  return process.platform === 'win32'
+    ? join(root, 'runtime', 'python.exe')
+    : join(root, 'runtime', 'bin', 'python3')
+}
 
 function resolveBackendPaths(): { python: string; script: string; cwd: string } {
-  const appRoot = app.isPackaged
-    ? join(process.resourcesPath, 'backend')
-    : join(app.getAppPath(), 'backend')
-
+  const appRoot = backendRoot()
   const isWin = process.platform === 'win32'
   // Preferred: a self-contained Python runtime shipped with the app (backend/runtime),
   // so the boss needs no system Python. Fall back to a local dev venv, then system python.
   const candidates = isWin
     ? [join(appRoot, 'runtime', 'python.exe'), join(appRoot, '.venv', 'Scripts', 'python.exe')]
     : [join(appRoot, 'runtime', 'bin', 'python3'), join(appRoot, '.venv', 'bin', 'python')]
-
   const python = candidates.find((p) => existsSync(p)) ?? (isWin ? 'python' : 'python3')
-  const script = join(appRoot, 'main.py')
+  return { python, script: join(appRoot, 'main.py'), cwd: appRoot }
+}
 
-  return { python, script, cwd: appRoot }
+// First-run setup is needed when we ship the bundled runtime but its heavy deps
+// haven't been installed yet (no marker). With no bundled runtime (pure dev with a
+// .venv), there's nothing to provision.
+function needsProvision(): boolean {
+  if (!existsSync(runtimePython())) return false
+  return !existsSync(join(backendRoot(), 'runtime', '.provisioned'))
+}
+
+function childEnv(): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    JARVIS_DATA_DIR: join(app.getPath('appData'), 'Jarvis', 'data'),
+    // Force UTF-8 so the backend's emoji log lines aren't mangled when captured
+    // on a non-UTF-8 Windows locale.
+    PYTHONUTF8: '1',
+    PYTHONIOENCODING: 'utf-8'
+  }
 }
 
 function startBackend(): void {
+  if (backendProcess) return
   const { python, script, cwd } = resolveBackendPaths()
-
   if (!existsSync(script)) {
     console.warn(`[jarvis] Backend not found at ${script} — expecting manual backend on ${BACKEND_URL}`)
     return
   }
-
-  // Redirect the backend's writable data (memory, email store, cache) to a per-user
-  // dir. When packaged, resources/backend is read-only (Program Files), so writing to
-  // the project-local ./data would fail — %APPDATA%\Jarvis\data is always writable.
-  const dataDir = join(app.getPath('appData'), 'Jarvis', 'data')
-
   console.log(`[jarvis] Starting backend: ${python} ${script}`)
   backendProcess = spawn(python, [script], {
     cwd,
-    env: {
-      ...process.env,
-      SERVER_PORT: BACKEND_PORT,
-      JARVIS_API_TOKEN: BACKEND_TOKEN,
-      JARVIS_DATA_DIR: dataDir,
-      // Force UTF-8 stdout/stderr so the backend's emoji log lines aren't mangled into
-      // mojibake when Electron captures them on a non-UTF-8 Windows locale.
-      PYTHONUTF8: '1',
-      PYTHONIOENCODING: 'utf-8'
-    },
+    env: { ...childEnv(), SERVER_PORT: BACKEND_PORT, JARVIS_API_TOKEN: BACKEND_TOKEN },
     stdio: ['ignore', 'pipe', 'pipe']
   })
-
-  backendProcess.stdout?.on('data', (data: Buffer) => {
-    console.log(`[backend] ${data.toString().trim()}`)
-  })
-
-  backendProcess.stderr?.on('data', (data: Buffer) => {
-    console.error(`[backend] ${data.toString().trim()}`)
-  })
-
+  backendProcess.stdout?.on('data', (d: Buffer) => console.log(`[backend] ${d.toString().trim()}`))
+  backendProcess.stderr?.on('data', (d: Buffer) => console.error(`[backend] ${d.toString().trim()}`))
   backendProcess.on('exit', (code) => {
     console.log(`[jarvis] Backend exited with code ${code}`)
     backendProcess = null
   })
 }
 
-function stopBackend(): void {
-  if (!backendProcess) return
-  backendProcess.kill('SIGTERM')
+function sendSetup(channel: string, payload?: unknown): void {
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(channel, payload)
+}
+
+// Spawn the first-run provisioner (pip-install the GPU deps + download the models)
+// and stream its JSON progress to the renderer's setup screen. On success, boot the
+// backend; on failure, surface it so the user can retry.
+function runProvision(): void {
+  if (provisionProcess) return
+  const python = runtimePython()
+  const script = join(backendRoot(), 'provision.py')
+  if (!existsSync(python) || !existsSync(script)) {
+    sendSetup('setup:error', { message: 'Setup files are missing from the installation.' })
+    return
+  }
+  console.log('[jarvis] Running first-run provisioner…')
+  provisionProcess = spawn(python, [script], { cwd: backendRoot(), env: childEnv(), stdio: ['ignore', 'pipe', 'pipe'] })
+
+  let buf = ''
+  let lastError = ''
+  const onData = (data: Buffer): void => {
+    buf += data.toString()
+    let nl = buf.indexOf('\n')
+    while (nl >= 0) {
+      const line = buf.slice(0, nl).trim()
+      buf = buf.slice(nl + 1)
+      nl = buf.indexOf('\n')
+      if (!line) continue
+      let msg: { type?: string; line?: string; message?: string } | null = null
+      try {
+        msg = JSON.parse(line)
+      } catch {
+        sendSetup('setup:log', line) // non-JSON (model warnings etc.) → log tail
+        continue
+      }
+      if (msg?.type === 'progress') sendSetup('setup:progress', msg)
+      else if (msg?.type === 'log') sendSetup('setup:log', msg.line ?? '')
+      else if (msg?.type === 'error') {
+        lastError = msg.message ?? ''
+        sendSetup('setup:log', `Error: ${lastError}`)
+      }
+    }
+  }
+  provisionProcess.stdout?.on('data', onData)
+  provisionProcess.stderr?.on('data', onData)
+
+  provisionProcess.on('exit', (code) => {
+    provisionProcess = null
+    if (code === 0) {
+      sendSetup('setup:done')
+      startBackend()
+    } else {
+      sendSetup('setup:error', {
+        message: lastError || `Setup failed (exit code ${code}). Check your internet connection and click Retry.`
+      })
+    }
+  })
+}
+
+function stopChildren(): void {
+  provisionProcess?.kill()
+  provisionProcess = null
+  backendProcess?.kill('SIGTERM')
   backendProcess = null
 }
 
-async function waitForBackend(timeoutMs = 30000): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) {
-    try {
-      const res = await fetch(`${BACKEND_URL}/health`)
-      if (res.ok) return true
-    } catch {
-      // retry
-    }
-    await new Promise((r) => setTimeout(r, 500))
-  }
-  return false
-}
-
 function createWindow(): void {
-  const mainWindow = new BrowserWindow({
+  mainWindow = new BrowserWindow({
     width: 1440,
     height: 900,
     minWidth: 1280,
@@ -113,31 +163,13 @@ function createWindow(): void {
     }
   })
 
-  mainWindow.on('ready-to-show', () => {
-    mainWindow.show()
+  mainWindow.on('ready-to-show', () => mainWindow?.show())
+  mainWindow.on('closed', () => {
+    mainWindow = null
   })
-
   mainWindow.webContents.setWindowOpenHandler((details) => {
     shell.openExternal(details.url)
     return { action: 'deny' }
-  })
-
-  ipcMain.on('window:minimize', (event) => {
-    BrowserWindow.fromWebContents(event.sender)?.minimize()
-  })
-
-  ipcMain.on('window:maximize', (event) => {
-    const win = BrowserWindow.fromWebContents(event.sender)
-    if (!win) return
-    if (win.isMaximized()) {
-      win.unmaximize()
-    } else {
-      win.maximize()
-    }
-  })
-
-  ipcMain.on('window:close', (event) => {
-    BrowserWindow.fromWebContents(event.sender)?.close()
   })
 
   if (process.env['ELECTRON_RENDERER_URL']) {
@@ -147,13 +179,31 @@ function createWindow(): void {
   }
 }
 
-app.whenReady().then(async () => {
-  startBackend()
-  const ready = await waitForBackend()
-  if (!ready) {
-    console.warn('[jarvis] Backend health check timed out — UI will start in offline mode')
-  }
+app.whenReady().then(() => {
+  // Frameless window controls
+  ipcMain.on('window:minimize', (e) => BrowserWindow.fromWebContents(e.sender)?.minimize())
+  ipcMain.on('window:maximize', (e) => {
+    const win = BrowserWindow.fromWebContents(e.sender)
+    if (!win) return
+    if (win.isMaximized()) win.unmaximize()
+    else win.maximize()
+  })
+  ipcMain.on('window:close', (e) => BrowserWindow.fromWebContents(e.sender)?.close())
+
+  // First-run setup
+  ipcMain.handle('setup:status', () => ({ needed: needsProvision() }))
+  ipcMain.on('setup:begin', () => {
+    if (needsProvision()) runProvision()
+  })
+  ipcMain.on('setup:retry', () => {
+    if (needsProvision()) runProvision()
+  })
+
   createWindow()
+
+  // If already provisioned, boot the backend now; the renderer polls /health.
+  // Otherwise the renderer shows the setup screen and calls setup:begin.
+  if (!needsProvision()) startBackend()
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
@@ -161,12 +211,8 @@ app.whenReady().then(async () => {
 })
 
 app.on('window-all-closed', () => {
-  stopBackend()
-  if (process.platform !== 'darwin') {
-    app.quit()
-  }
+  stopChildren()
+  if (process.platform !== 'darwin') app.quit()
 })
 
-app.on('before-quit', () => {
-  stopBackend()
-})
+app.on('before-quit', () => stopChildren())

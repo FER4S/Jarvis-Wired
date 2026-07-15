@@ -8,6 +8,7 @@ out/
 dist/
 release/
 .vite/
+*.tsbuildinfo
 
 # Secrets — never commit
 .env
@@ -44,3 +45,6 @@ Thumbs.db
 # Logs
 *.log
 npm-debug.log*
+
+# AI-guidance notes — keep local, not pushed to GitHub
+CLAUDE.md

@@ -1,8 +1,9 @@
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import { HashRouter, Navigate, Route, Routes } from 'react-router-dom'
 import { BackendProvider } from '@/context/BackendContext'
 import { ThemeProvider } from '@/context/ThemeContext'
 import { AppShell } from '@/components/layout/AppShell'
+import { SetupScreen } from '@/components/setup/SetupScreen'
 import { CommandCenter } from '@/pages/CommandCenter'
 import { EmailPage } from '@/pages/EmailPage'
 import { SystemControlPage } from '@/pages/SystemControlPage'
@@ -39,11 +40,32 @@ function AppRoutes() {
 }
 
 export default function App() {
+  const [phase, setPhase] = useState<'checking' | 'setup' | 'ready'>('checking')
+
+  useEffect(() => {
+    let cancelled = false
+    void (async () => {
+      try {
+        const status = await window.jarvis?.setup?.status()
+        if (!cancelled) setPhase(status?.needed ? 'setup' : 'ready')
+      } catch {
+        if (!cancelled) setPhase('ready') // no setup API (e.g. plain browser) → just show the app
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
   return (
     <ThemeProvider>
-      <BackendProvider>
-        <AppRoutes />
-      </BackendProvider>
+      {phase === 'checking' ? null : phase === 'setup' ? (
+        <SetupScreen onComplete={() => setPhase('ready')} />
+      ) : (
+        <BackendProvider>
+          <AppRoutes />
+        </BackendProvider>
+      )}
     </ThemeProvider>
   )
 }
