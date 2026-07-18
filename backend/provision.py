@@ -114,8 +114,16 @@ def download_models() -> None:
     import config
 
     progress(80, "models", "Downloading speech-to-text model…")
-    from faster_whisper import WhisperModel
-    WhisperModel(config.WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
+    # Download-only: instantiating WhisperModel here would also int8-convert
+    # the (now large) model in RAM just to provision it. download_model()
+    # fetches the same files into the same HF cache the runtime load uses.
+    from faster_whisper import download_model
+    download_model(config.WHISPER_MODEL_SIZE)
+
+    fallback_model = getattr(config, "WHISPER_CPU_FALLBACK_MODEL", "")
+    if fallback_model and fallback_model != config.WHISPER_MODEL_SIZE:
+        progress(85, "models", "Downloading fallback speech-to-text model…")
+        download_model(fallback_model)
 
     progress(88, "models", "Downloading wake-word model…")
     from openwakeword.utils import download_models as oww_download

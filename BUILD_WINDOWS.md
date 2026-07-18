@@ -1,201 +1,174 @@
-# Jarvis Desktop — Run & Package (Windows)
+# BUILD_WINDOWS.md — Build & ship the Jarvis Desktop installer
 
-This project is the **full** Jarvis (wake word → STT → Claude → TTS, **plus** persistent
-memory and multi-account email) with the Command Center Electron UI on top. Target: a
-one-click Windows app for the boss's machine (**RTX 5090**, no coding tools installed).
+How this app is packaged for a non-technical Windows user (the "boss": RTX 5090, no dev tools).
+**This reflects the actual shipping design — a slim installer + first-run provisioning.** (An
+earlier draft described bundling everything into the installer; that was abandoned because it
+produced an ~5 GB download and broke the NSIS build — see "Why slim".)
 
-- `backend/` — your full Python voice backend (authoritative; copied from FER4S/Jarvis).
-- `src/` — the Electron/React UI (from the front-end dev), wired to the backend.
+Read [CLAUDE.md](CLAUDE.md) first for the architecture and backend↔UI wiring.
 
-The Electron main process spawns the backend, waits for `/health`, injects a per-launch
-auth token, and points the backend's data at `%APPDATA%\Jarvis\data`.
+## The packaging model (read this first)
 
----
+- The installer is **small (~119 MB)** because it ships a **bare Python runtime** — standalone
+  Python 3.10 + pip only, **no** torch/CUDA/models.
+- On the target machine's **first launch**, the app shows a **setup screen** and runs
+  `backend/provision.py`, which pip-installs the pinned GPU deps (`backend/requirements-lock.txt`)
+  and downloads the STT/wake/TTS models — **~4–5 GB, ~15–40 min, once, needs internet**. Then it
+  boots; every later launch is instant and offline.
+- Key files: `backend/provision.py` (the installer script), `backend/requirements-lock.txt`
+  (149 pinned deps), `src/main/index.ts` (spawns provisioner, streams progress, gates the
+  backend), `src/preload/index.ts` (`window.jarvis.setup`), `src/components/setup/SetupScreen.tsx`,
+  `src/App.tsx` (renders SetupScreen until provisioned), `package.json` `build` block.
 
-## Part 1 — Run it in dev (verify the merge works)
-
-On your Windows dev machine:
-
-```powershell
-# 1. Backend deps (GPU — see Part 3 for the RTX 5090 / Blackwell CUDA note)
-cd C:\Users\majd_\Jarvis-Desktop\backend
-python -m venv .venv
-.venv\Scripts\activate
-# Fastest on your dev machine: copy your existing .venv instead of reinstalling (see the
-# Tip below). To install fresh, use cu128 — it's your original proven build
-# (torch 2.7.1+cu128); it runs on your 3060 and is what the boss's RTX 5090 (Blackwell) needs.
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
-pip install -r requirements.txt
-copy .env.example .env      # set ANTHROPIC_API_KEY (+ Google OAuth vars if using Gmail)
-# Leave JARVIS_API_TOKEN blank in .env — Electron injects one at runtime.
-
-# 2. Frontend deps
-cd ..
-npm install
-
-# 3. Run (Electron auto-spawns the backend)
-npm run dev
-```
-
-> **Important:** create `backend\.venv` as above *before* `npm run dev`. If it's missing,
-> Electron silently falls back to your **system** Python — which likely lacks the CUDA
-> libraries, so Whisper/Kokoro run on **CPU** (exactly the `cublas64_12.dll not found → CPU`
-> fallback you'd see in the logs).
-
-> **Tip (fastest on your dev machine):** instead of the `pip install` steps, copy your
-> existing venv — same bytes, no re-download:
-> ```powershell
-> robocopy "C:\Users\majd_\OneDrive\Desktop\Jarvis\.venv" "C:\Users\majd_\Jarvis-Desktop\backend\.venv" /E
-> ```
-> Works because it's the **same machine** (its `pyvenv.cfg` still points at your Python 3.10).
-> It will **not** run on the boss's machine — that's what the self-contained `runtime`
-> (Part 2) is for. You still need `backend\.env` with your `ANTHROPIC_API_KEY`.
-
-Verify:
-- UI top bar shows **Online**.
-- `Ctrl+Space` starts/stops the pipeline — this proves the **auth-token wiring** (if it
-  were broken you'd get 401s and stay Offline).
-- Say **"Hey Jarvis"** → transcription appears and you hear a spoken reply.
-- Say **"remember that ..."** and ask an **email** question → proves the full backend
-  (memory + email) is live, not the stripped version.
-- Data lands in `%APPDATA%\Jarvis\data`, not in the project folder.
-
-> First run downloads the STT/TTS/wake models (~0.5–1 GB) and triggers spoken onboarding
-> (fresh memory). That's expected.
+### Why slim — do NOT revert to bundling everything
+Bundling the GPU deps makes `backend/runtime` ~8 GB → a ~5 GB installer, impractical to send.
+Worse: unless `package.json` `files` is scoped, electron-builder also packs the whole project
+(incl. an 8 GB `backend/.venv`) into `app.asar`, giving an 8 GB `.7z` that 32-bit `makensis`
+**cannot mmap — the build fails outright** (`File: failed creating mmap`). Slim + first-run
+download sidesteps all of it.
 
 ---
 
-## Part 2 — Build the one-click installer for the boss
-
-Goal: one `.exe` the boss double-clicks. No Python, no Node, no terminal.
-
-### 2.1  Bundle a self-contained Python (the part that needs care)
-
-A normal `.venv` is **not portable** on Windows — it still depends on the base Python
-install, which the boss won't have. So ship a **self-contained** Python runtime as
-`backend\runtime\`. Electron is already wired to prefer `backend\runtime\python.exe`
-(`src/main/index.ts` → `resolveBackendPaths()`), then fall back to `.venv`, then system.
-
-Recommended route (uses `uv`, which installs relocatable standalone CPython):
-
-```powershell
-# install uv once: https://astral.sh/uv
-uv python install 3.12
-uv python find 3.12          # prints the standalone install path
-# copy that whole folder to backend\runtime (it is self-contained):
-xcopy /E /I "<path from above>" "C:\Users\majd_\Jarvis-Desktop\backend\runtime"
-
-# install deps INTO that runtime (GPU build — see Part 3):
-cd C:\Users\majd_\Jarvis-Desktop\backend
-.\runtime\python.exe -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
-.\runtime\python.exe -m pip install -r requirements.txt
-```
-
-Test it standalone before packaging: `.\runtime\python.exe main.py` → then
-`curl http://127.0.0.1:8000/health` should return ok.
-
-> **Alternative if the runtime route fights you:** PyInstaller (`onedir`) freezing
-> `main.py` to an exe. Reliable but needs
-> `--collect-all torch --collect-all kokoro --collect-all faster_whisper --collect-all openwakeword`
-> plus the CUDA DLLs. If you go this way, point `resolveBackendPaths()` at the `.exe`.
-> **This Python-bundling step is the single biggest effort in the whole project — budget
-> iteration for it.**
-
-### 2.2  Models — download on first run (default) or pre-bundle (optional)
-
-Default: models download automatically on first launch (needs internet once, ~0.5–1 GB).
-Simplest to ship; the boss just needs to be online the first time.
-
-Optional (offline/instant first run): after downloading them in dev, set `HF_HOME` to a
-folder inside `backend\` and copy the caches there so they ship in `extraResources`; have
-Electron pass that `HF_HOME` in the spawn env (same place it sets `JARVIS_DATA_DIR`).
-
-### 2.3  Create the clean shipping `.env`
-
-Create `backend\.env` at build time (it's git-ignored, so it only exists on your machine):
-
-```env
-ANTHROPIC_API_KEY=sk-ant-...        # a key/budget you're OK shipping (anyone with the app has it)
-GOOGLE_OAUTH_CLIENT_ID=...          # your Google app client — lets the boss connect HIS Gmail
-GOOGLE_OAUTH_CLIENT_SECRET=...
-# leave JARVIS_API_TOKEN blank — Electron injects it per launch
-```
-
-Do **not** copy your personal `.env`, and never include a `backend\data\` folder — the
-boss must start with fresh memory and connect his own email accounts. (Both are already in
-`.gitignore`, and `data/` is excluded from the packaged bundle.)
-
-### 2.4  Build
+## Part 1 — Dev run (`npm run dev`)
 
 ```powershell
 cd C:\Users\majd_\Jarvis-Desktop
 npm install
-npm run dist        # → NSIS one-click installer in release\
+npm run dev        # Electron spawns the backend and opens the UI
 ```
 
-`package.json` is already configured: `win`/`nsis`, one-click **per-user** (no admin
-prompt), bundling `backend\` (including `runtime\`, excluding `__pycache__`, `*.pyc`,
-`data\`).
+For the backend to work in dev, `backend/runtime` must be a **full** runtime (deps installed) —
+see "Runtime states". Then verify: UI reaches **Online**; `Ctrl+Space` toggles the pipeline
+(proves the auth token); "Hey Jarvis" → transcript + spoken reply; "remember that…" + an email
+question prove memory + email are live. Data lands in `%APPDATA%\Jarvis\data` (NOT `backend/data/`).
 
-### 2.5  Send the boss
+### Runtime states — the ONE thing to understand
+`backend/runtime/`'s state drives everything:
 
-Send the single file from `release\` (e.g. `JARVIS Command Center Setup 1.0.0.exe`). He
-double-clicks it; it installs per-user and launches. Done.
+| State | Contents | Behavior |
+|---|---|---|
+| **Slim** (what SHIPS) | standalone python + pip only (~58 MB), **no** `.provisioned` marker | App shows the **setup screen** and provisions on launch |
+| **Full** (for dev)   | slim + all deps + `.provisioned` marker | App skips setup; backend runs immediately |
+
+- **Make it full (for dev):** with a slim runtime present, just run the provisioner once —
+  `cd backend; runtime\python.exe provision.py` — it pip-installs the deps, downloads models, and
+  writes the marker (exactly what the boss's first run does). ~4–5 GB first time; cached after.
+- **Make it slim (before building):** Part 2.1.
+- `resolveBackendPaths()` prefers `backend/runtime`, then `backend/.venv`, then system python — so
+  a slim runtime *always* triggers setup. Delete `backend/runtime` to fall back to a dev `.venv`.
 
 ---
 
-## Part 3 — RTX 5090 (Blackwell) GPU notes  ← check this FIRST, it's the main risk
+## Part 2 — Build the installer
 
-The 5090 is Blackwell (sm_120). Older `cu121` PyTorch wheels **don't ship kernels for it**
-and fail with *"no kernel image is available"*. Use a Blackwell-capable CUDA wheel:
-
+### 2.1  Make the runtime SLIM (recreate a bare standalone Python via `uv`)
 ```powershell
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+# once: install uv → irm https://astral.sh/uv/install.ps1 | iex   (lands at %USERPROFILE%\.local\bin\uv.exe)
+uv python install 3.10
+# The standalone lands here. (`uv python find` can be unreliable if the install prints a harmless
+# "Missing expected target directory … minor version link" warning — the Python still extracts fine.)
+$std = (Get-ChildItem "$env:APPDATA\uv\python" -Directory -Filter 'cpython-3.10.*-windows-x86_64-none' | Select-Object -First 1).FullName
+Remove-Item C:\Users\majd_\Jarvis-Desktop\backend\runtime -Recurse -Force -ErrorAction SilentlyContinue
+robocopy $std C:\Users\majd_\Jarvis-Desktop\backend\runtime /E
+# verify: backend\runtime\python.exe --version  →  Python 3.10.x ; site-packages holds only pip/setuptools
 ```
 
-(Confirm the current Blackwell index at pytorch.org — `cu128` or newer.) faster-whisper
-uses CTranslate2 with the `nvidia-cublas-cu12` / `nvidia-cudnn-cu12` wheels pinned in
-`requirements.txt`; verify they load on the card. Your `stt.py`/`tts.py` **auto-fall back
-to CPU** if CUDA fails, so a wheel mismatch degrades gracefully instead of crashing — but
-you want GPU, so check the backend log says CUDA, not the CPU `int8` fallback.
+### 2.2  The dependency lock (`backend/requirements-lock.txt`, committed)
+Pins the **exact** 149 packages provisioning installs — captured from a known-good full runtime so
+first-run reproduces a verified environment. It pins **`torch==2.7.1+cu128`** (from the cu128
+index) and pulls `en_core_web_sm` from a GitHub URL. **Only regenerate if deps change:** from a
+*full* runtime run `runtime\python.exe -m pip freeze > backend\requirements-lock.txt`, then
+**rewrite the torch line** — `pip freeze` emits a local `torch @ file:///…Desktop\Jarvis\torch-…whl`
+path that won't exist elsewhere; replace it with `torch==2.7.1+cu128`.
+
+### 2.3  The clean shipping `backend/.env` (git-ignored — create on your machine)
+```env
+ANTHROPIC_API_KEY=sk-ant-...        # a key/budget you're OK shipping — anyone with the app has it
+GOOGLE_OAUTH_CLIENT_ID=...          # your Google app client — lets the user connect THEIR Gmail
+GOOGLE_OAUTH_CLIENT_SECRET=...
+JARVIS_API_TOKEN=                   # leave blank — Electron injects one per launch
+```
+Never ship `backend/data/` (personal memory + accounts); it's excluded from the bundle and ignored.
+
+### 2.4  `package.json` `build` (already set — do NOT break)
+```jsonc
+"files": ["out/**", "package.json"],              // CRITICAL — keeps backend/ (incl. .venv) OUT of app.asar
+"extraResources": [{ "from": "backend", "to": "backend",
+  "filter": ["**/*", "!**/__pycache__/**", "!**/*.pyc", "!data/**", "!.venv/**"] }],
+"win":  { "target": ["nsis"] },
+"nsis": { "oneClick": true, "perMachine": false, "runAfterFinish": true }
+```
+
+### 2.5  Build + distribute
+```powershell
+cd C:\Users\majd_\Jarvis-Desktop
+npm run dist        # → release\JARVIS Command Center Setup <ver>.exe  (~119 MB)
+```
+Send **only that `.exe`** (ignore `win-unpacked/`, `latest.yml`, `.blockmap`, `builder-debug.yml`).
+It's too big for email — use **Google Drive / WeTransfer / Dropbox**.
 
 ---
 
-## Part 4 — Verify before shipping
-
-On a **clean** Windows machine (or a fresh user account with no Python):
-- [ ] Installer runs with no admin prompt; app launches; UI reaches **Online** within ~30s.
-- [ ] No `backend\data` was bundled; `%APPDATA%\Jarvis\data` is created fresh on first run.
-- [ ] Onboarding runs (his memory, not yours); "Hey Jarvis" → transcript → spoken reply.
-- [ ] He can connect his own email account from the dashboard; memory/email survive a restart.
-- [ ] On the 5090, the backend log shows **CUDA/GPU** in use (not CPU int8 fallback).
-
-Backend-only smoke checks still work with the runtime, e.g. from `backend\`:
-`.\runtime\python.exe -m core.email_manager`.
+## Part 3 — What the target machine does on first launch
+1. Double-click the `.exe`. SmartScreen may warn "unknown publisher" (unsigned) → **More info →
+   Run anyway** (once). Installs per-user, no admin.
+2. First launch → **"Setting up JARVIS"** screen: pip-installs GPU deps + downloads models, ~4–5 GB
+   over ~15–40 min (needs internet), with a progress bar + live log. `provision.py` is
+   **idempotent/resumable** (pip + HF caches persist) and shows a **Retry** button on error.
+3. On finish it boots into the Command Center; onboarding runs (his own fresh memory), he connects
+   his own email. Every later launch is instant + offline.
 
 ---
 
-## Part 5 — Troubleshooting
-
-- **SmartScreen "unknown publisher"**: the installer is unsigned. Tell the boss *More info
-  → Run anyway* once, or buy a code-signing certificate.
-- **UI stuck Offline**: backend didn't start, or token mismatch. Check the Electron console
-  for `[backend]` lines; confirm `backend\runtime\python.exe` exists in the install and
-  that `main.py` runs standalone.
-- **`env` not recognized**: already fixed — the `dev`/`preview` scripts no longer use the
-  unix-only `env -u`. If you re-pull the dev's repo, re-apply that fix.
-- **Mic not detected**: Windows mic privacy setting; only one app can hold the mic at a time.
-- **GPU not used**: see Part 3 (Blackwell wheel).
+## Part 4 — Where it installs / how to open + debug
+- **Install dir:** `%LOCALAPPDATA%\Programs\jarvis-command-center\` (exe `JARVIS Command Center.exe`;
+  bundled backend at `resources\backend\`, provisioner at `resources\backend\provision.py`).
+- **Open via Start Menu → "JARVIS Command Center".** Do **NOT** re-run `Setup.exe` to open it —
+  that reinstalls and re-triggers setup (wipes the runtime deps + `.provisioned` marker;
+  re-provisioning is fast from cache, but it's not how you launch).
+- **Quick fix without rebuilding:** edit the *installed* `resources\backend\provision.py` directly
+  and hit **Retry** on the setup screen (that's how the `--break-system-packages` fix was validated
+  live before rebuilding).
+- **Reset a machine's memory/accounts:** delete `%APPDATA%\Jarvis\data`.
+- **Caches (survive reinstalls):** pip wheels in `%LOCALAPPDATA%\pip\Cache`; models in the Hugging
+  Face cache under `%USERPROFILE%`. This is why re-provisioning after a reinstall is fast.
 
 ---
 
-## What changed vs. the two source repos
+## Part 5 — Critical gotchas (we hit ALL of these — don't re-break)
+1. **`--break-system-packages`** is REQUIRED in `provision.py`'s pip call — the standalone Python is
+   PEP-668 "externally managed" and pip refuses to install into it otherwise (error:
+   `externally-managed-environment`).
+2. **`files: ["out/**","package.json"]`** — without it, electron-builder packs the whole project
+   (incl. `backend/.venv`, 8 GB) into `app.asar` → 8 GB `.7z` → 32-bit makensis "failed creating
+   mmap" → build fails.
+3. **Slim the runtime before `npm run dist`** — a full runtime bloats the installer and can OOM
+   makensis.
+4. **Torch pin** — the lock must be `torch==2.7.1+cu128` (from `--index-url .../whl/cu128`), not the
+   `file://` path `pip freeze` emits.
+5. `provision.py` writes `backend/runtime/.provisioned` on success; delete it (or the deps) to force
+   re-setup.
 
-- Backend = your full FER4S/Jarvis (`@ef657bb`): memory + all four email modules restored
-  (the dev's repo had stripped them out).
-- Integration: Electron generates `JARVIS_API_TOKEN`, injects it into the backend and the
-  renderer; `backendClient` sends `Bearer` on `/start`,`/stop` and `?token=` on `/events`.
-- `JARVIS_DATA_DIR` → per-user writable data dir (packaged install dir is read-only).
-- `resolveBackendPaths()` prefers a bundled `backend/runtime` Python.
-- `package.json`: `win`/`nsis` + backend `extraResources`; removed the unix-only `env -u`
-  from the dev scripts.
+---
+
+## Part 6 — GPU / Blackwell (RTX 5090)
+The lock uses **torch cu128** (Blackwell-capable). Older cu121 wheels fail on the 5090 with "no
+kernel image is available". faster-whisper uses CTranslate2 with pinned `nvidia-cublas-cu12` /
+`nvidia-cudnn-cu12`; `core/stt.py` adds `runtime\Lib\site-packages\nvidia\*\bin` to the DLL path
+(the "CUDA shim"). `stt.py`/`tts.py` auto-fall back to CPU if CUDA fails, so **verify the backend
+log shows CUDA/GPU, not the CPU int8 fallback**. (Validated on a 3060; the 5090 is the same path.)
+
+## Part 7 — Troubleshooting
+- **Setup: "Package installation failed / check your internet"** → a real network blip (Retry — it
+  resumes) OR `--break-system-packages` is missing from `provision.py`.
+- **UI stuck Offline after setup** → backend didn't boot; confirm `backend\runtime\python.exe`
+  exists and `runtime\python.exe main.py` runs from `resources\backend` (imports torch, etc.).
+- **SmartScreen** → unsigned installer; "Run anyway", or code-sign it.
+- **Mic not detected** → Windows mic privacy; only one app can hold the mic at a time.
+
+## Part 8 — Next steps (NOT done yet)
+- **Auto-update** (electron-updater + a release feed) so updates ship as small code diffs, not a
+  5 GB re-download. For that to be clean, install the provisioned deps into a **persistent** dir
+  (e.g. `%APPDATA%\Jarvis\pydeps`, added to the runtime's path) so an app update doesn't wipe them.
+  The `latest.yml` + `.blockmap` files in `release/` are the electron-updater metadata.
+- **Code-sign** the installer to remove the SmartScreen warning.
