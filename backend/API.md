@@ -22,6 +22,7 @@ The frontend must be configured with the same value and present it as follows:
 | `WS /events` | Query param: `ws://localhost:8000/events?token=<token>` (browsers can't set headers on WebSocket handshakes) | Handshake rejected (close code 1008 / HTTP 403) |
 | All `/email/*` endpoints, except the one below | HTTP header `Authorization: Bearer <token>` | `401 {"detail": "Missing or invalid API token."}` |
 | `GET /email/accounts/gmail/oauth-callback` | Not bearer-protected — Google's redirect is a plain browser GET that can't carry the header. Instead requires the one-time `state` query param minted by the (bearer-protected) `GET /email/accounts/gmail/oauth-url` — so an unset token still blocks the whole OAuth flow. | `403` (HTML page: invalid, reused, or expired link) |
+| All `/memory/*` endpoints | HTTP header `Authorization: Bearer <token>` | `401 {"detail": "Missing or invalid API token."}` |
 | `GET /health`, `GET /status` | No token required | — |
 
 ## REST Endpoints
@@ -247,6 +248,124 @@ Connects and manages email accounts (Hostinger-style IMAP and Gmail via OAuth), 
 - **Error Responses:**
   - `400 {"detail": "That doesn't look like a valid email address."}` — malformed. Checked before anything else, so a request that expires mid-flight can never be reported as a bad address.
   - `409 {"detail": "Jarvis isn't waiting for a contact's email address."}` — nothing pending, or the request expired.
+
+## Memory Endpoints
+
+Jarvis's persistent memory of the boss — his `profile`, the `people` he knows, plus `facts` and `events` — read and edited manually from the dashboard's Account tab. This is the same store the voice loop reads from and the background extractor writes to; there is exactly one per process, guarded by its own lock, so an edit here and an extraction merge can't clobber each other.
+
+**Things that trip people up:**
+
+- **Entry ids are opaque and not stable across a delete + re-add.** `people` and `events` carry a stored `id`; a **fact's `id` is derived from its text**, so editing a fact changes its id. Always re-read `GET /memory` after a mutation rather than assuming an id survived.
+- **Writes are per-entry, never a whole-document PUT.** That is deliberate: the boss can have an edit form open while a conversation ends and the extractor merges new entries, and per-entry writes mean the two touch different entries.
+- **`writable: false` means saves are being refused for this session** — `memory.json` was unreadable at startup and couldn't be quarantined, so the file on disk is being protected. Every mutation then returns `503`. Show this as a banner; do not present the store as editable.
+- **Deleting a fact doesn't stop Jarvis re-learning it.** Memory is re-extracted from conversations, so a fact the boss removes can come back if he says it again.
+- **Editing the profile marks onboarding complete**, because typing your own profile *is* the onboarding. Without that, the next launch would run voice onboarding and replace everything just typed.
+
+### 1. Get Everything In Memory
+- **URL:** `GET /memory`
+- **Auth:** Requires `Authorization: Bearer <token>`; returns `401` otherwise.
+- **Description:** The whole store in one call. `profile` is a free-form string map (the canonical keys are `name`, `role`, `key_people`, `priorities`, `preferences`, but onboarding can leave a single `raw_qa` key if it failed to structure the answers, and other keys may exist — render unknown keys rather than dropping them).
+- **Example Response:**
+  ```json
+  {
+    "profile": {"name": "Feras", "role": "CEO at CodeX"},
+    "people": [{"id": "3f9a1c2b…", "name": "Michael Heckin", "notes": "CTO", "email": "michael@codex.com"}],
+    "events": [{"id": "7c8d9e0f…", "description": "Board meeting", "date": "2026-07-20"}],
+    "facts": [{"id": "a1b2c3d4e5f6a7b8", "text": "Prefers afternoon meetings."}],
+    "onboarding_complete": true,
+    "last_updated": "2026-07-19T09:15:00+03:00",
+    "writable": true
+  }
+  ```
+
+### 2. Replace The Profile
+- **URL:** `PUT /memory/profile`
+- **Auth:** Requires `Authorization: Bearer <token>`; returns `401` otherwise.
+- **Description:** Replaces the profile wholesale — **not a merge**, so omitting a key deletes it (that is the only way to remove a key the extractor drifted in). Keys with empty values are dropped. Also sets `onboarding_complete`.
+- **Request Body:**
+  ```json
+  {"profile": {"name": "Feras", "role": "CEO at CodeX", "priorities": "Ship Jarvis"}}
+  ```
+- **Example Response:** `{"profile": {"name": "Feras", "role": "CEO at CodeX", "priorities": "Ship Jarvis"}}`
+- **Error Responses:**
+  - `503 {"detail": "Couldn't save to memory. …"}` — saves are refused or the write failed.
+
+### 3. People — Add / Edit / Delete
+- **URLs:** `POST /memory/people` · `PATCH /memory/people/{person_id}` · `DELETE /memory/people/{person_id}`
+- **Auth:** Requires `Authorization: Bearer <token>`; returns `401` otherwise.
+- **Description:** A person is `{id, name, notes, email}`. `POST` **refuses a duplicate name** (409) rather than silently merging — unlike the voice/extraction path, which merges by name. On `PATCH`, only the fields present are changed; `notes` **replaces** (it does not append, which is what an extraction merge does), and `email: ""` explicitly clears a wrong address.
+- **Note — an address typed into `notes` is lifted into `email`.** Consistent with what the store does on restart, so a typed address doesn't appear to move on its own later.
+- **Request Body (`POST`):**
+  ```json
+  {"name": "Michael Heckin", "notes": "CTO", "email": "michael@codex.com"}
+  ```
+- **Example Response:** `{"person": {"id": "3f9a1c2b…", "name": "Michael Heckin", "notes": "CTO", "email": "michael@codex.com"}}`
+- **Error Responses:**
+  - `400 {"detail": "A name is required."}` / `400 {"detail": "That doesn't look like a valid email address."}`
+  - `404 {"detail": "No saved person with that id."}`
+  - `409 {"detail": "Someone with that name is already saved."}` — also on a `PATCH` rename onto an existing name.
+  - `503` — see above.
+
+### 4. Facts — Add / Edit / Delete
+- **URLs:** `POST /memory/facts` · `PATCH /memory/facts/{fact_id}` · `DELETE /memory/facts/{fact_id}`
+- **Auth:** Requires `Authorization: Bearer <token>`; returns `401` otherwise.
+- **Description:** A fact is a plain string, addressed by an id **derived from its text** — so a successful `PATCH` returns a *different* id than the one you sent. Duplicates are refused case-insensitively. Editing preserves list position, because the context summary Jarvis sends to Claude is budgeted recency-first.
+- **Request Body:** `{"text": "Prefers afternoon meetings."}`
+- **Example Response:** `{"fact": {"id": "a1b2c3d4e5f6a7b8", "text": "Prefers afternoon meetings."}}`
+- **Error Responses:** `400` empty · `404` unknown id · `409 {"detail": "Jarvis already remembers that."}` · `503`.
+
+### 5. Events — Add / Edit / Delete
+- **URLs:** `POST /memory/events` · `PATCH /memory/events/{event_id}` · `DELETE /memory/events/{event_id}`
+- **Auth:** Requires `Authorization: Bearer <token>`; returns `401` otherwise.
+- **Description:** An event is `{id, description, date}`. `date` is free-form text, not a validated date (it holds whatever was said — "2026-07-20", "5pm", or ""). Duplicate descriptions are refused, because `description` is still the key the voice paths match on.
+- **Note — an empty `date` on `PATCH` clears it.** The voice paths deliberately never blank a stored date (an empty value there means "didn't hear one"); a person clearing the box means it.
+- **Request Body:** `{"description": "Board meeting", "date": "2026-07-20"}`
+- **Example Response:** `{"event": {"id": "7c8d9e0f…", "description": "Board meeting", "date": "2026-07-20"}}`
+- **Error Responses:** `400` empty description · `404` unknown id · `409` duplicate description · `503`.
+
+### 6. Bulk Import — Preview
+- **URL:** `POST /memory/import/preview`
+- **Auth:** Requires `Authorization: Bearer <token>`; returns `401` otherwise.
+- **Description:** Structures a pasted blob (a contact list, meeting notes) into proposed entries using the background-tier model. **Writes nothing.** The response is meant to be shown in an editable review table; the reviewed rows then go to `/memory/import/commit`.
+- **Per-person the preview says what committing would do:** `action` is `"new"` or `"merge"`, `existing_id`/`existing_notes`/`existing_email` describe the entry it would merge into, and `notes_preview` is **exactly** the notes text the merge would produce. Because the merge skips a note already contained in the old one, re-running the same import is a no-op.
+- **Addresses are gated, and the gate matters.** An address is kept only if it is well-formed **and** appears in the pasted text — matched against the exact set of addresses found there, not as a substring (a substring test would accept `michael@codex.co` from a source saying `michael@codex.com`). A rejected address is blanked and the row carries `email_status` of `"invalid"` or `"not_in_source"`; surface that so the boss can retype it.
+- **Request Body:** `{"text": "Michael Heckin — CTO — michael@codex.com\nSara — design lead"}`
+- **Example Response:**
+  ```json
+  {"preview": {
+    "people": [{"name": "Michael Heckin", "notes": "CTO", "email": "michael@codex.com",
+                "email_status": "ok", "action": "merge", "existing_id": "3f9a1c2b…",
+                "existing_notes": "Runs infra", "existing_email": "",
+                "notes_preview": "Runs infra; CTO", "merged_from_rows": 1}],
+    "facts": [], "events": [],
+    "warnings": ["1 email address(es) were removed because they don't appear in the text you pasted."]
+  }}
+  ```
+- **Error Responses:**
+  - `400 {"detail": "That text is too long to process at once. …"}` — over the paste cap.
+  - `400 {"detail": "That list was too long to process in one go. …"}` — the model ran out of output tokens mid-list; split the paste.
+  - `400 {"detail": "There's nothing to import."}`
+  - `502 {"detail": "Couldn't make sense of that text. …"}`
+
+### 7. Bulk Import — Commit
+- **URL:** `POST /memory/import/commit`
+- **Auth:** Requires `Authorization: Bearer <token>`; returns `401` otherwise.
+- **Description:** Writes the reviewed rows. Takes **only the rows** — never the raw text — and never calls a model, so what the boss approved is exactly what is stored. People merge by name (notes appended, an empty email slot filled); set `replace_email: true` on a row to overwrite an address the person already had. Facts and events dedup as they do everywhere else. The whole batch is one write.
+- **Note — addresses here are validated for shape only.** The in-the-source check can't apply, because a row the boss corrected in the review table legitimately isn't in the paste any more. This is the same trust level as `POST /email/pending-contact`: a typed address is used as typed.
+- **Request Body:**
+  ```json
+  {
+    "people": [{"name": "Michael Heckin", "notes": "CTO", "email": "michael@codex.com", "replace_email": false}],
+    "facts": ["Allergic to peanuts."],
+    "events": [{"description": "Q3 review", "date": "2026-09-01"}]
+  }
+  ```
+- **Example Response:**
+  ```json
+  {"result": {"people_created": 1, "people_merged": 0, "facts_added": 1,
+              "facts_skipped": 0, "events_added": 1, "events_updated": 0}}
+  ```
+- **Error Responses:** `503` — see above.
 
 ## WebSocket Events
 

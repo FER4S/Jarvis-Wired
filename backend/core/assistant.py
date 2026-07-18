@@ -357,6 +357,21 @@ class JarvisAssistant:
         """
         return self._email
 
+    def get_memory(self) -> MemoryManager:
+        """
+        Exposes the single shared MemoryManager instance, for the same reason
+        get_email_manager() exists: api/server.py's /memory/* endpoints must
+        edit the very store this conversation loop reads from, not a second
+        copy of it. Its own lock makes concurrent access from the API thread
+        safe.
+
+        NOTE: the store is only populated by load(), which run() calls AFTER
+        the Whisper/Kokoro models finish loading. api/server.py's lifespan
+        therefore calls load() itself so the dashboard never sees (or worse,
+        saves over) an empty store during startup.
+        """
+        return self._memory
+
     def _set_state(self, new_state: AssistantState) -> None:
         self._state = new_state
 

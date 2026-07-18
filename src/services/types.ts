@@ -122,6 +122,84 @@ export interface GmailOAuthUrlResponse {
   expires_in: number
 }
 
+// ── Memory (Account tab) ─────────────────────────────────────────────────────
+// Mirrors backend/core/memory.py. People and events carry a stored id; a fact's
+// id is DERIVED from its text, so editing a fact changes its id — always use
+// the id the server just returned rather than the one you sent.
+
+/** Free-form. Canonical keys are name/role/key_people/priorities/preferences,
+ *  but onboarding can leave a single `raw_qa` key and others may drift in. */
+export type MemoryProfile = Record<string, string>
+
+export interface MemoryPerson {
+  id: string
+  name: string
+  notes: string
+  email: string
+}
+
+export interface MemoryEvent {
+  id: string
+  description: string
+  /** Free-form text, not a validated date ("2026-07-20", "5pm", or ""). */
+  date: string
+}
+
+export interface MemoryFact {
+  id: string
+  text: string
+}
+
+export interface MemorySnapshot {
+  profile: MemoryProfile
+  people: MemoryPerson[]
+  events: MemoryEvent[]
+  facts: MemoryFact[]
+  onboarding_complete: boolean
+  last_updated: string
+  /** False = saves are being refused this session; show a read-only banner. */
+  writable: boolean
+}
+
+/** Why an address the model returned was dropped. */
+export type MemoryEmailStatus = 'ok' | 'invalid' | 'not_in_source'
+
+export interface MemoryImportPersonRow {
+  name: string
+  notes: string
+  email: string
+  email_status: MemoryEmailStatus
+  action: 'new' | 'merge'
+  existing_id: string | null
+  existing_notes: string
+  existing_email: string
+  /** Exactly what the merged notes would read as, if committed. */
+  notes_preview: string
+  merged_from_rows: number
+}
+
+export interface MemoryImportPreview {
+  people: MemoryImportPersonRow[]
+  facts: string[]
+  events: Array<{ description: string; date: string }>
+  warnings: string[]
+}
+
+export interface MemoryImportCommitRequest {
+  people: Array<{ name: string; notes: string; email: string; replace_email: boolean }>
+  facts: string[]
+  events: Array<{ description: string; date: string }>
+}
+
+export interface MemoryImportResult {
+  people_created: number
+  people_merged: number
+  facts_added: number
+  facts_skipped: number
+  events_added: number
+  events_updated: number
+}
+
 export interface Agent {
   id: string
   name: string

@@ -33,6 +33,9 @@ assistant = JarvisAssistant()
 # double-poll and race the cache file; see core/email_manager.py's module
 # docstring).
 email_manager = assistant.get_email_manager()
+# Same rule for memory: the /memory/* endpoints edit the store the voice loop
+# reads from, never a second copy. MemoryManager's own lock makes that safe.
+memory = assistant.get_memory()
 
 # ── API token auth ────────────────────────────────────────────────────────────
 # /start, /stop and /events carry control of the assistant and the live
@@ -99,10 +102,19 @@ async def broadcast_events():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: load the email account store/cache, start its poller (both
-    # calls are idempotent - assistant.run(), if also active, may have
-    # already done this; see core/email_manager.py's module docstring), then
-    # start the background event broadcaster task.
+    # Startup: load the memory store FIRST. assistant.run() also loads it, but
+    # only after Whisper and Kokoro finish loading - minutes, on a first run
+    # that downloads model weights - and never at all if that loading raises.
+    # Until it happens the store is an empty _empty_state(), and because every
+    # mutator rewrites the whole file, a single dashboard edit in that window
+    # would persist the empty state over the boss's real memory.json. Loading
+    # here closes the window. Idempotent for the same reason
+    # email_manager.initialize() is: either path may go first, and load()
+    # simply re-reads from disk under the lock that guards writes.
+    await asyncio.to_thread(memory.load)
+    # Then the email account store/cache and its poller (both calls idempotent
+    # - see core/email_manager.py's module docstring), then the background
+    # event broadcaster task.
     await asyncio.to_thread(email_manager.initialize)
     email_manager.start_polling()
     task = asyncio.create_task(broadcast_events())
@@ -465,3 +477,252 @@ async def delete_email_account(account_id: str) -> Dict[str, str]:
 async def email_summary() -> Dict[str, Any]:
     """Dashboard payload: unread counts + recent subjects/senders per account."""
     return email_manager.get_summary()
+
+
+# ── Memory endpoints ──────────────────────────────────────────────────────────
+# The dashboard's manual editor for what Jarvis remembers: profile, people,
+# facts, events. Every handler runs through asyncio.to_thread because each
+# memory operation does a full json.dump + os.replace under a lock, and
+# blocking the event loop also stalls broadcast_events().
+#
+# All writes are per-entry, never a whole-document PUT: a dashboard edit and a
+# background extraction merge then touch different entries and are serialized by
+# MemoryManager's own lock, so neither can clobber the other's work.
+#
+# _WRITE_FAILED_DETAIL is what a refused save looks like to the boss. It matters
+# that this is a real error and not a silent success: memory.json can be locked
+# (OneDrive/AV) or saves disabled after a quarantine, and a dashboard that
+# rendered "Saved" over a file that never changed would be worse than useless.
+
+_WRITE_FAILED_DETAIL = (
+    "Couldn't save to memory. The memory file may be locked or read-only — "
+    "check the backend log and try again."
+)
+
+
+class ProfileRequest(BaseModel):
+    """The whole profile, replacing what's stored (so a key can be removed)."""
+    profile: Dict[str, str] = Field(default_factory=dict)
+
+
+class PersonCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    notes: str = Field(default="", max_length=2000)
+    email: str = Field(default="", max_length=254)
+
+
+class PersonUpdateRequest(BaseModel):
+    """Only the fields present are changed; email="" explicitly clears it."""
+    name: Optional[str] = Field(default=None, min_length=1, max_length=120)
+    notes: Optional[str] = Field(default=None, max_length=2000)
+    email: Optional[str] = Field(default=None, max_length=254)
+
+
+class FactRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=1000)
+
+
+class EventCreateRequest(BaseModel):
+    description: str = Field(min_length=1, max_length=500)
+    date: str = Field(default="", max_length=100)
+
+
+class EventUpdateRequest(BaseModel):
+    description: Optional[str] = Field(default=None, min_length=1, max_length=500)
+    date: Optional[str] = Field(default=None, max_length=100)
+
+
+class ImportPreviewRequest(BaseModel):
+    """Raw pasted text. Structured by a model, but never stored from here."""
+    text: str = Field(min_length=1, max_length=100_000)
+
+
+class ImportPersonRow(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    notes: str = Field(default="", max_length=2000)
+    email: str = Field(default="", max_length=254)
+    replace_email: bool = False
+
+
+class ImportEventRow(BaseModel):
+    description: str = Field(min_length=1, max_length=500)
+    date: str = Field(default="", max_length=100)
+
+
+class ImportCommitRequest(BaseModel):
+    """The reviewed rows only - never the raw text, never re-parsed."""
+    people: list[ImportPersonRow] = Field(default_factory=list)
+    facts: list[str] = Field(default_factory=list)
+    events: list[ImportEventRow] = Field(default_factory=list)
+
+
+def _memory_write_guard(status: str) -> None:
+    """Map a MemoryManager write status onto the shared HTTP error vocabulary."""
+    if status == "write_failed":
+        raise HTTPException(status_code=503, detail=_WRITE_FAILED_DETAIL)
+
+
+@app.get("/memory", tags=["memory"], dependencies=[Depends(require_token)])
+async def get_memory() -> Dict[str, Any]:
+    """Everything Jarvis remembers, plus `writable` (false = saves refused)."""
+    return await asyncio.to_thread(memory.get_snapshot)
+
+
+@app.put("/memory/profile", tags=["memory"], dependencies=[Depends(require_token)])
+async def update_memory_profile(request: ProfileRequest) -> Dict[str, Any]:
+    saved = await asyncio.to_thread(memory.update_profile, request.profile)
+    if not saved:
+        raise HTTPException(status_code=503, detail=_WRITE_FAILED_DETAIL)
+    snapshot = await asyncio.to_thread(memory.get_snapshot)
+    return {"profile": snapshot["profile"]}
+
+
+@app.post("/memory/people", tags=["memory"], dependencies=[Depends(require_token)])
+async def add_memory_person(request: PersonCreateRequest) -> Dict[str, Any]:
+    status, person = await asyncio.to_thread(
+        memory.add_person, request.name, request.notes, request.email
+    )
+    if status == "invalid_name":
+        raise HTTPException(status_code=400, detail="A name is required.")
+    if status == "invalid_email":
+        raise HTTPException(status_code=400, detail="That doesn't look like a valid email address.")
+    if status == "duplicate":
+        raise HTTPException(status_code=409, detail="Someone with that name is already saved.")
+    _memory_write_guard(status)
+    return {"person": person}
+
+
+@app.patch("/memory/people/{person_id}", tags=["memory"], dependencies=[Depends(require_token)])
+async def update_memory_person(person_id: str, request: PersonUpdateRequest) -> Dict[str, Any]:
+    status, person = await asyncio.to_thread(
+        memory.update_person, person_id, request.name, request.notes, request.email
+    )
+    if status == "not_found":
+        raise HTTPException(status_code=404, detail="No saved person with that id.")
+    if status == "invalid_name":
+        raise HTTPException(status_code=400, detail="A name is required.")
+    if status == "invalid_email":
+        raise HTTPException(status_code=400, detail="That doesn't look like a valid email address.")
+    if status == "duplicate":
+        raise HTTPException(status_code=409, detail="Someone else with that name is already saved.")
+    _memory_write_guard(status)
+    return {"person": person}
+
+
+@app.delete("/memory/people/{person_id}", tags=["memory"], dependencies=[Depends(require_token)])
+async def delete_memory_person(person_id: str) -> Dict[str, str]:
+    status = await asyncio.to_thread(memory.delete_person, person_id)
+    if status == "not_found":
+        raise HTTPException(status_code=404, detail="No saved person with that id.")
+    _memory_write_guard(status)
+    return {"status": "deleted"}
+
+
+@app.post("/memory/facts", tags=["memory"], dependencies=[Depends(require_token)])
+async def add_memory_fact(request: FactRequest) -> Dict[str, Any]:
+    status, fact = await asyncio.to_thread(memory.add_fact, request.text)
+    if status == "invalid_text":
+        raise HTTPException(status_code=400, detail="The fact can't be empty.")
+    if status == "duplicate":
+        raise HTTPException(status_code=409, detail="Jarvis already remembers that.")
+    _memory_write_guard(status)
+    return {"fact": fact}
+
+
+@app.patch("/memory/facts/{fact_id}", tags=["memory"], dependencies=[Depends(require_token)])
+async def update_memory_fact(fact_id: str, request: FactRequest) -> Dict[str, Any]:
+    status, fact = await asyncio.to_thread(memory.update_fact, fact_id, request.text)
+    if status == "not_found":
+        raise HTTPException(status_code=404, detail="No saved fact with that id.")
+    if status == "invalid_text":
+        raise HTTPException(status_code=400, detail="The fact can't be empty.")
+    if status == "duplicate":
+        raise HTTPException(status_code=409, detail="Jarvis already remembers that.")
+    _memory_write_guard(status)
+    return {"fact": fact}
+
+
+@app.delete("/memory/facts/{fact_id}", tags=["memory"], dependencies=[Depends(require_token)])
+async def delete_memory_fact(fact_id: str) -> Dict[str, str]:
+    status = await asyncio.to_thread(memory.delete_fact, fact_id)
+    if status == "not_found":
+        raise HTTPException(status_code=404, detail="No saved fact with that id.")
+    _memory_write_guard(status)
+    return {"status": "deleted"}
+
+
+@app.post("/memory/events", tags=["memory"], dependencies=[Depends(require_token)])
+async def add_memory_event(request: EventCreateRequest) -> Dict[str, Any]:
+    status, event = await asyncio.to_thread(
+        memory.add_event_entry, request.description, request.date
+    )
+    if status == "invalid_description":
+        raise HTTPException(status_code=400, detail="A description is required.")
+    if status == "duplicate":
+        raise HTTPException(status_code=409, detail="An event with that description is already saved.")
+    _memory_write_guard(status)
+    return {"event": event}
+
+
+@app.patch("/memory/events/{event_id}", tags=["memory"], dependencies=[Depends(require_token)])
+async def update_memory_event(event_id: str, request: EventUpdateRequest) -> Dict[str, Any]:
+    status, event = await asyncio.to_thread(
+        memory.update_event, event_id, request.description, request.date
+    )
+    if status == "not_found":
+        raise HTTPException(status_code=404, detail="No saved event with that id.")
+    if status == "invalid_description":
+        raise HTTPException(status_code=400, detail="A description is required.")
+    if status == "duplicate":
+        raise HTTPException(status_code=409, detail="Another event with that description is already saved.")
+    _memory_write_guard(status)
+    return {"event": event}
+
+
+@app.delete("/memory/events/{event_id}", tags=["memory"], dependencies=[Depends(require_token)])
+async def delete_memory_event(event_id: str) -> Dict[str, str]:
+    status = await asyncio.to_thread(memory.delete_event, event_id)
+    if status == "not_found":
+        raise HTTPException(status_code=404, detail="No saved event with that id.")
+    _memory_write_guard(status)
+    return {"status": "deleted"}
+
+
+@app.post("/memory/import/preview", tags=["memory"], dependencies=[Depends(require_token)])
+async def preview_memory_import(request: ImportPreviewRequest) -> Dict[str, Any]:
+    """
+    Structure pasted text into proposed entries. Writes NOTHING - the caller
+    reviews (and edits) the rows, then posts them to /memory/import/commit.
+    """
+    status, preview = await asyncio.to_thread(memory.preview_import, request.text)
+    if status == "too_long":
+        raise HTTPException(
+            status_code=400,
+            detail="That text is too long to process at once. Please paste it in two or three smaller batches.",
+        )
+    if status == "truncated":
+        raise HTTPException(
+            status_code=400,
+            detail="That list was too long to process in one go. Please paste it in two or three smaller batches.",
+        )
+    if status == "empty":
+        raise HTTPException(status_code=400, detail="There's nothing to import.")
+    if status == "unparseable":
+        raise HTTPException(
+            status_code=502,
+            detail="Couldn't make sense of that text. Try again, or paste a smaller section.",
+        )
+    return {"preview": preview}
+
+
+@app.post("/memory/import/commit", tags=["memory"], dependencies=[Depends(require_token)])
+async def commit_memory_import(request: ImportCommitRequest) -> Dict[str, Any]:
+    """Write the reviewed import rows. Never re-parses and never calls a model."""
+    status, counts = await asyncio.to_thread(
+        memory.commit_import,
+        [row.model_dump() for row in request.people],
+        list(request.facts),
+        [row.model_dump() for row in request.events],
+    )
+    _memory_write_guard(status)
+    return {"result": counts}

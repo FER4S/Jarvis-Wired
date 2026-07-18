@@ -3,7 +3,15 @@ import type {
   EmailAccount,
   EmailSummaryResponse,
   GmailOAuthUrlResponse,
-  ImapAccountRequest
+  ImapAccountRequest,
+  MemoryEvent,
+  MemoryFact,
+  MemoryImportCommitRequest,
+  MemoryImportPreview,
+  MemoryImportResult,
+  MemoryPerson,
+  MemoryProfile,
+  MemorySnapshot
 } from './types'
 
 export type JarvisEventType =
@@ -260,6 +268,96 @@ class BackendClient {
     if (!res.ok) return null
     const data = await res.json()
     return data?.pending ? { name: data.pending.name ?? '' } : null
+  }
+
+  // ── Memory (Account tab) ───────────────────────────────────────────────────
+  // Every write is per-entry on purpose: an edit here and a background memory
+  // extraction then touch different entries and can't clobber each other. Always
+  // re-read getMemory() after a mutation rather than patching local state.
+
+  private async memoryWrite(path: string, method: string, body?: unknown): Promise<any> {
+    const res = await fetch(`${getApiBaseUrl()}${path}`, {
+      method,
+      headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body)
+    })
+    if (!res.ok) throw new Error(await parseErrorDetail(res, `Memory update failed: ${res.status}`))
+    return res.status === 204 ? null : res.json()
+  }
+
+  async getMemory(): Promise<MemorySnapshot> {
+    const res = await fetch(`${getApiBaseUrl()}/memory`, { headers: authHeaders() })
+    if (!res.ok) throw new Error(await parseErrorDetail(res, `Failed to load memory: ${res.status}`))
+    return res.json()
+  }
+
+  async updateMemoryProfile(profile: MemoryProfile): Promise<MemoryProfile> {
+    const data = await this.memoryWrite('/memory/profile', 'PUT', { profile })
+    return data.profile
+  }
+
+  async addMemoryPerson(body: {
+    name: string
+    notes?: string
+    email?: string
+  }): Promise<MemoryPerson> {
+    const data = await this.memoryWrite('/memory/people', 'POST', body)
+    return data.person
+  }
+
+  async updateMemoryPerson(
+    id: string,
+    body: { name?: string; notes?: string; email?: string }
+  ): Promise<MemoryPerson> {
+    const data = await this.memoryWrite(`/memory/people/${id}`, 'PATCH', body)
+    return data.person
+  }
+
+  async deleteMemoryPerson(id: string): Promise<void> {
+    await this.memoryWrite(`/memory/people/${id}`, 'DELETE')
+  }
+
+  async addMemoryFact(text: string): Promise<MemoryFact> {
+    const data = await this.memoryWrite('/memory/facts', 'POST', { text })
+    return data.fact
+  }
+
+  async updateMemoryFact(id: string, text: string): Promise<MemoryFact> {
+    const data = await this.memoryWrite(`/memory/facts/${id}`, 'PATCH', { text })
+    return data.fact
+  }
+
+  async deleteMemoryFact(id: string): Promise<void> {
+    await this.memoryWrite(`/memory/facts/${id}`, 'DELETE')
+  }
+
+  async addMemoryEvent(body: { description: string; date?: string }): Promise<MemoryEvent> {
+    const data = await this.memoryWrite('/memory/events', 'POST', body)
+    return data.event
+  }
+
+  async updateMemoryEvent(
+    id: string,
+    body: { description?: string; date?: string }
+  ): Promise<MemoryEvent> {
+    const data = await this.memoryWrite(`/memory/events/${id}`, 'PATCH', body)
+    return data.event
+  }
+
+  async deleteMemoryEvent(id: string): Promise<void> {
+    await this.memoryWrite(`/memory/events/${id}`, 'DELETE')
+  }
+
+  /** Structures pasted text into proposed entries. Writes nothing. */
+  async previewMemoryImport(text: string): Promise<MemoryImportPreview> {
+    const data = await this.memoryWrite('/memory/import/preview', 'POST', { text })
+    return data.preview
+  }
+
+  /** Writes the REVIEWED rows — never the raw text, never re-parsed. */
+  async commitMemoryImport(body: MemoryImportCommitRequest): Promise<MemoryImportResult> {
+    const data = await this.memoryWrite('/memory/import/commit', 'POST', body)
+    return data.result
   }
 
   connect(): void {
