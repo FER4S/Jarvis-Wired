@@ -263,6 +263,32 @@ class BackendClient {
     }
   }
 
+  /**
+   * Hand Jarvis a typed message. Queued, not answered inline — the reply
+   * arrives over the WebSocket as the usual transcription -> llm_response pair,
+   * so there is nothing to render from the return value.
+   */
+  async sendMessage(text: string): Promise<void> {
+    const res = await fetch(`${getApiBaseUrl()}/message`, {
+      method: 'POST',
+      headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text })
+    })
+    if (!res.ok) throw new Error(await parseErrorDetail(res, `Failed to send message: ${res.status}`))
+  }
+
+  /** Turn Jarvis's spoken replies off or on (he still answers in the transcript). */
+  async setMuted(muted: boolean): Promise<boolean> {
+    const res = await fetch(`${getApiBaseUrl()}/speech/mute`, {
+      method: 'POST',
+      headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ muted })
+    })
+    if (!res.ok) throw new Error(await parseErrorDetail(res, `Failed to change speech: ${res.status}`))
+    const data = await res.json()
+    return !!data.muted
+  }
+
   async getPendingContact(): Promise<{ name: string } | null> {
     const res = await fetch(`${getApiBaseUrl()}/email/pending-contact`, { headers: authHeaders() })
     if (!res.ok) return null

@@ -36,6 +36,9 @@ email_manager = assistant.get_email_manager()
 # Same rule for memory: the /memory/* endpoints edit the store the voice loop
 # reads from, never a second copy. MemoryManager's own lock makes that safe.
 memory = assistant.get_memory()
+# And for typed messages: POST /message must fill the very slot the voice loop
+# drains. TypedInputBox owns its lock.
+typed_input = assistant.get_typed_input()
 
 # ── API token auth ────────────────────────────────────────────────────────────
 # /start, /stop and /events carry control of the assistant and the live
@@ -148,9 +151,24 @@ app.add_middleware(
 
 
 @app.get("/health", tags=["meta"])
-async def health_check() -> Dict[str, str]:
-    """Simple liveness probe for the Electron frontend."""
-    return {"status": "ok", "service": "jarvis"}
+async def health_check() -> Dict[str, Any]:
+    """
+    Liveness probe for the Electron frontend.
+
+    Also reports whether the assistant is up, because the dashboard bootstraps
+    from this one call: it reads `assistant_running` to decide whether to POST
+    /start and whether to enable the message box. Returning only status/service
+    (as this did) left the frontend's `assistant_running` permanently undefined
+    -> `running` always false -> a 60x2s poll waiting for a field that never
+    arrived, and a message box that could never be enabled.
+    """
+    return {
+        "status": "ok",
+        "service": "jarvis",
+        "assistant_running": assistant.is_active(),
+        "models_ready": assistant.are_models_ready(),
+        "state": assistant.get_state().value,
+    }
 
 
 @app.get("/status", tags=["state"])
@@ -160,6 +178,7 @@ async def get_status() -> Dict[str, Any]:
         "running": assistant.is_active(),
         "state": assistant.get_state().value,
         "error": assistant.get_last_error(),
+        "muted": assistant.is_muted(),
     }
 
 
@@ -172,6 +191,59 @@ async def start_assistant() -> Dict[str, str]:
     logger.info("Starting Jarvis Assistant from API request...")
     threading.Thread(target=assistant.run, name="jarvis-main-loop", daemon=True).start()
     return {"status": "started"}
+
+
+class MessageRequest(BaseModel):
+    """A message typed into the dashboard instead of spoken."""
+    text: str = Field(min_length=1, max_length=2000)
+
+
+class MuteRequest(BaseModel):
+    """Whether Jarvis should answer out loud."""
+    muted: bool
+
+
+@app.post("/message", tags=["control"], dependencies=[Depends(require_token)])
+async def send_message(request: MessageRequest) -> Dict[str, str]:
+    """
+    Hand Jarvis a typed message. It is processed exactly like a spoken one —
+    same memory and email intercepts, same reply — and shows up in the
+    transcript via the usual `transcription` (source="typed") → `llm_response`
+    events.
+
+    Queues, rather than answering inline: the assistant is single-threaded by
+    construction (one conversation at a time), so this drops the message in a
+    slot the voice loop drains. If Jarvis is idle it starts a conversation; if
+    he's mid-conversation it becomes the next turn, cutting short whatever
+    listening window is open. Hence 202 rather than 200 — accepted, not
+    completed.
+
+    No asyncio.to_thread: this is a lock-guarded in-memory write, like
+    submit_contact_email, not blocking I/O.
+    """
+    if not assistant.is_active():
+        raise HTTPException(
+            status_code=409,
+            detail="Jarvis isn't running. Start the assistant and try again.",
+        )
+    if not typed_input.submit(request.text):
+        raise HTTPException(status_code=400, detail="The message can't be empty.")
+    return {"status": "accepted"}
+
+
+@app.post("/speech/mute", tags=["control"], dependencies=[Depends(require_token)])
+async def set_speech_muted(request: MuteRequest) -> Dict[str, Any]:
+    """
+    Turn Jarvis's spoken replies off or on. Muted, he still answers — the reply
+    appears in the transcript — he just doesn't say it out loud.
+
+    Applies to everything he speaks, with one deliberate exception: first-run
+    onboarding stays audible, because a silent onboarding would ask questions
+    nobody could hear. The setting is per-process and resets on restart; the
+    dashboard re-applies its stored preference whenever it reconnects.
+    """
+    assistant.set_muted(request.muted)
+    return {"muted": assistant.is_muted()}
 
 
 @app.post("/stop", tags=["control"], dependencies=[Depends(require_token)])

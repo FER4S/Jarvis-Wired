@@ -18,7 +18,7 @@ The frontend must be configured with the same value and present it as follows:
 
 | Surface | How to send the token | On failure |
 |---|---|---|
-| `POST /start`, `POST /stop` | HTTP header `Authorization: Bearer <token>` | `401 {"detail": "Missing or invalid API token."}` |
+| `POST /start`, `POST /stop`, `POST /message`, `POST /speech/mute` | HTTP header `Authorization: Bearer <token>` | `401 {"detail": "Missing or invalid API token."}` |
 | `WS /events` | Query param: `ws://localhost:8000/events?token=<token>` (browsers can't set headers on WebSocket handshakes) | Handshake rejected (close code 1008 / HTTP 403) |
 | All `/email/*` endpoints, except the one below | HTTP header `Authorization: Bearer <token>` | `401 {"detail": "Missing or invalid API token."}` |
 | `GET /email/accounts/gmail/oauth-callback` | Not bearer-protected — Google's redirect is a plain browser GET that can't carry the header. Instead requires the one-time `state` query param minted by the (bearer-protected) `GET /email/accounts/gmail/oauth-url` — so an unset token still blocks the whole OAuth flow. | `403` (HTML page: invalid, reused, or expired link) |
@@ -29,12 +29,16 @@ The frontend must be configured with the same value and present it as follows:
 
 ### 1. Health Check
 - **URL:** `GET /health`
-- **Description:** Simple liveness probe to verify the server is running.
+- **Description:** Liveness probe, plus enough state for a dashboard to bootstrap from this single call: whether the assistant is up, whether the heavy models have finished loading, and the current pipeline state.
+- **Note:** `models_ready` is `false` during the (potentially multi-minute) Whisper/Kokoro load even though `assistant_running` is already `true` — that window is "up but still starting", and it is when a freshly-launched dashboard should show a loading state rather than enabling controls.
 - **Example Response:**
   ```json
   {
     "status": "ok",
-    "service": "jarvis"
+    "service": "jarvis",
+    "assistant_running": true,
+    "models_ready": true,
+    "state": "idle"
   }
   ```
 
@@ -48,9 +52,11 @@ The frontend must be configured with the same value and present it as follows:
   {
     "running": true,
     "state": "idle",
-    "error": null
+    "error": null,
+    "muted": false
   }
   ```
+- **Note:** `muted` is whether spoken output is currently suppressed (see `POST /speech/mute`). It resets to `false` on every backend restart, so a dashboard that offers the toggle should re-apply its stored preference when it connects.
 
 ### 3. Start Assistant
 - **URL:** `POST /start`
@@ -72,6 +78,42 @@ The frontend must be configured with the same value and present it as follows:
   {
     "status": "stopped"
   }
+  ```
+
+### 5. Send a Typed Message
+- **URL:** `POST /message`
+- **Auth:** Requires `Authorization: Bearer <token>`; returns `401` otherwise.
+- **Description:** Hands Jarvis a message typed instead of spoken. It is processed exactly like a spoken utterance — same memory and email intercepts, same reply — and appears in the transcript through the ordinary `transcription` (with `source: "typed"`) → `llm_response` events.
+- **Queued, not answered inline.** Conversations are strictly serial, so this drops the message into a slot the voice loop drains. If Jarvis is idle it starts a conversation; if he is mid-conversation it becomes the next turn, **cutting short whatever listening window is open** (~32 ms). The response body therefore says nothing about the reply — watch the WebSocket for that.
+- **It also answers Jarvis's own questions.** Every clarifying question in the email/memory sub-dialogues accepts a typed answer, so a whole email can be sent — recipient, wording, and the final "should I send it?" — without speaking.
+- **At most one message is held.** Sending a second before the first is picked up replaces it (a correction typed in time does the right thing). A queued message is discarded if it goes unclaimed for 120 seconds, so one typed while the models were still loading can't surface minutes later out of context.
+- **Request Body:**
+  ```json
+  {"text": "email Michael and tell him the meeting moved to Thursday"}
+  ```
+- **Example Response:**
+  ```json
+  {"status": "accepted"}
+  ```
+- **Error Responses:**
+  - `400 {"detail": "The message can't be empty."}` — whitespace only.
+  - `409 {"detail": "Jarvis isn't running. Start the assistant and try again."}` — the pipeline is stopped; nothing would ever drain the message.
+  - `422` — missing/oversized `text` (1–2000 characters).
+
+### 6. Mute / Unmute Spoken Replies
+- **URL:** `POST /speech/mute`
+- **Auth:** Requires `Authorization: Bearer <token>`; returns `401` otherwise.
+- **Description:** Turns Jarvis's spoken output off or on. Muted, he still answers — the reply is emitted as `llm_response` and appears in the transcript — he just doesn't say it out loud.
+- **Applies to everything he speaks** (the greeting, replies, email/memory confirmations, drafted-email readbacks), with one deliberate exception: **first-run onboarding stays audible**, because a silent onboarding would ask five questions nobody could hear and record five blank answers.
+- **`speaking_started` / `speaking_ended` are still emitted while muted**, so a dashboard's state machine doesn't strand itself waiting for a "finished speaking" that never comes. Treat mute as a global UI state (read `muted` from `GET /status`), not as an absence of events.
+- **Per-process, resets on restart.** Persist the preference client-side and re-apply it on connect.
+- **Request Body:**
+  ```json
+  {"muted": true}
+  ```
+- **Example Response:**
+  ```json
+  {"muted": true}
   ```
 
 ## Email Endpoints
@@ -381,7 +423,7 @@ All events are broadcast as JSON objects containing an `"event"` field and any a
 |---|---|---|
 | `wake_word_detected` | Fired when the wake word is detected. | `{"event": "wake_word_detected"}` |
 | `listening_started` | Fired when the microphone starts recording. | `{"event": "listening_started"}` |
-| `transcription` | Fired when speech-to-text finishes processing. | `{"event": "transcription", "text": "Hello Jarvis"}` |
+| `transcription` | Fired when the user's input is ready — speech-to-text finishing, **or** a typed message being picked up. `source` is `"voice"` (default when absent) or `"typed"`. | `{"event": "transcription", "text": "Hello Jarvis", "source": "voice"}` |
 | `llm_response` | Fired when Claude finishes generating a reply. | `{"event": "llm_response", "text": "Hello! How can I help you today?"}` |
 | `speaking_started` | Fired when text-to-speech audio starts playing. | `{"event": "speaking_started"}` |
 | `speaking_ended` | Fired when text-to-speech audio finishes playing. | `{"event": "speaking_ended"}` |
@@ -391,6 +433,8 @@ All events are broadcast as JSON objects containing an `"event"` field and any a
 | `contact_email_resolved` | Fired when that request ends. `source` is `"voice"` (spoken and confirmed), `"typed"` (submitted from the dashboard), or `"cancelled"` (never supplied — nothing was sent). Cue to hide the text box. | `{"event": "contact_email_resolved", "source": "typed"}` |
 
 **Note — sending email:** there are no events for drafting, confirming, or sending. The whole exchange — "here's what I've got…", "should I send it?", "sent to Michael" — flows through the ordinary `llm_response` → `speaking_started` → `speaking_ended` → `listening_started` → `transcription` sequence, so a transcript view shows it with no special handling. The two `contact_email_*` events above are the only additions, and they exist solely so the dashboard can offer typing as an alternative to speaking an address.
+
+**Note — typed messages:** a message sent with `POST /message` produces the same event sequence as a spoken turn, with two differences a frontend should expect. It carries `source: "typed"` on its `transcription` event. And it may produce **no `listening_started`** at all: when the message was already waiting, Jarvis never opens the microphone, so claiming he was "listening" would be false — don't rely on `listening_started` as a guaranteed precursor to `transcription`. When speech and a typed message arrive at nearly the same moment, the speech wins that turn and the typed message is used for the next one, so a message is never silently dropped. While muted, `speaking_started`/`speaking_ended` still fire with no audio.
 
 **Note — proactive email announcements:** no new event types were added for these. When the background email poller finds new mail and Jarvis is idle, it speaks a nudge (e.g. "Hey, you've got 3 new emails…") using the same `llm_response` → `speaking_started` → `speaking_ended` sequence as a normal reply, followed immediately by the usual `listening_started`/`transcription`/... cycle for whatever the boss says next — exactly as if "Hey Jarvis" had just been said. The only difference a frontend can key off is that this `llm_response` has **no preceding `wake_word_detected`** event. Dashboards should poll `GET /email/summary` for email state rather than relying on WebSocket events.
 

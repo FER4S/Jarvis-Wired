@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react'
 import { Link } from 'react-router-dom'
 import { motion } from 'framer-motion'
-import { Mail, Mic, Power, PowerOff, Send, Server } from 'lucide-react'
+import { Mail, Mic, Power, PowerOff, Send, Server, Volume2, VolumeX } from 'lucide-react'
 import { BrutalPanel } from '@/components/ui/BrutalPanel'
 import { BrutalInput, brutalBtnClass } from '@/components/ui/BrutalInput'
 import { useBackend } from '@/context/BackendContext'
@@ -38,31 +38,42 @@ function TranscriptBubble({ entry }: { entry: TranscriptEntry }) {
 }
 
 export function ConversationTranscriptPanel() {
-  const { transcript, connected, running, voiceState } = useBackend()
+  const { transcript, connected, running, muted, sendMessage, setMuted } = useBackend()
   const [draft, setDraft] = useState('')
+  const [sending, setSending] = useState(false)
+  const [sendError, setSendError] = useState<string | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
-  const visibleMessages = transcript.slice(-2)
 
-  const busy =
-    voiceState === 'listening' || voiceState === 'processing' || voiceState === 'speaking'
-
+  // Deliberately NOT gated on whether Jarvis is busy: typing is allowed while
+  // he's listening, thinking or speaking — a typed message cuts a listening
+  // window short so it lands immediately.
+  const disabled = !connected || !running
   const placeholder = !connected
     ? 'Connect backend in Account settings…'
     : !running
       ? 'Start assistant to begin…'
-      : busy
-        ? 'Jarvis is busy…'
-        : 'Message Jarvis…'
+      : 'Message Jarvis…'
 
   useEffect(() => {
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight
     }
-  }, [visibleMessages])
+  }, [transcript])
 
-  const handleSubmit = (e: FormEvent) => {
+  const handleSubmit = async (e: FormEvent) => {
     e.preventDefault()
-    setDraft('')
+    const text = draft.trim()
+    if (!text || sending) return
+    setSending(true)
+    setSendError(null)
+    try {
+      await sendMessage(text)
+      setDraft('') // only on success, so a failed send doesn't lose what he typed
+    } catch (err) {
+      setSendError(err instanceof Error ? err.message : 'Could not send that message.')
+    } finally {
+      setSending(false)
+    }
   }
 
   return (
@@ -72,7 +83,7 @@ export function ConversationTranscriptPanel() {
           ref={scrollRef}
           className="flex-1 min-h-0 overflow-y-auto px-4 pt-4 pb-3 flex flex-col justify-end gap-3"
         >
-          {visibleMessages.length === 0 ? (
+          {transcript.length === 0 ? (
             <div className="flex flex-col items-center justify-center gap-3 py-6 text-center">
               <div className="w-11 h-11 border-2 border-black/80 bg-[#12141c] shadow-[2px_2px_0px_0px_black] flex items-center justify-center">
                 <Mic size={18} className="text-amber-400" strokeWidth={2.5} />
@@ -85,27 +96,46 @@ export function ConversationTranscriptPanel() {
               </p>
             </div>
           ) : (
-            visibleMessages.map((entry) => <TranscriptBubble key={entry.id} entry={entry} />)
+            transcript.map((entry) => <TranscriptBubble key={entry.id} entry={entry} />)
           )}
         </div>
 
+        {sendError && (
+          <p className="shrink-0 px-3 pb-2 font-mono text-[10px] uppercase text-rose-400">
+            {sendError}
+          </p>
+        )}
+
         <form
-          onSubmit={handleSubmit}
+          onSubmit={(e) => void handleSubmit(e)}
           className="shrink-0 border-t-2 border-black bg-[#111318] px-3 py-3 flex items-center gap-2"
         >
+          <button
+            type="button"
+            onClick={() => void setMuted(!muted)}
+            disabled={!connected}
+            className={`shrink-0 flex h-[42px] w-[42px] items-center justify-center border-2 border-black shadow-[3px_3px_0px_0px_black] disabled:opacity-40 disabled:cursor-not-allowed ${
+              muted ? 'bg-[#252833] text-slate-400' : 'bg-amber-400 text-black'
+            }`}
+            aria-label={muted ? 'Unmute Jarvis' : 'Mute Jarvis'}
+            aria-pressed={muted}
+            title={muted ? "Jarvis is silent — click to let him speak" : 'Jarvis speaks — click to silence him'}
+          >
+            {muted ? <VolumeX size={16} strokeWidth={3} /> : <Volume2 size={16} strokeWidth={3} />}
+          </button>
           <BrutalInput
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
             placeholder={placeholder}
-            disabled={!connected || !running || busy}
+            disabled={disabled}
             className="flex-1 min-w-0"
           />
           <button
             type="submit"
-            disabled={!connected || !running || busy || draft.trim().length === 0}
+            disabled={disabled || sending || draft.trim().length === 0}
             className="shrink-0 flex h-[42px] w-[42px] items-center justify-center border-2 border-black bg-pink-500 text-black shadow-[3px_3px_0px_0px_black] hover:shadow-[4px_4px_0px_0px_black] disabled:opacity-40 disabled:cursor-not-allowed"
             aria-label="Send message"
-            title="Voice only — use the mic bar below"
+            title="Send to Jarvis (Enter)"
           >
             <Send size={16} strokeWidth={3} />
           </button>

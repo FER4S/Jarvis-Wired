@@ -1,6 +1,7 @@
 import { NavLink } from 'react-router-dom'
 import { WindowControls } from '@/components/layout/WindowControls'
 import { useBackend } from '@/context/BackendContext'
+import { getAppVersion } from '@/services/release'
 
 const navLinks = [
   { to: '/', label: 'Command', end: true },
@@ -22,7 +23,7 @@ export function TopBar() {
           <div className="hidden sm:block">
             <p className="font-sans text-sm font-semibold t-text leading-none">Jarvis</p>
             <p className="font-mono text-[9px] t-text-muted uppercase tracking-wider mt-0.5">
-              Command Center
+              Command Center <span className="opacity-70">v{getAppVersion()}</span>
             </p>
           </div>
         </div>

@@ -19,6 +19,7 @@ import sys
 import threading
 import queue
 from enum import Enum
+from typing import NamedTuple
 
 # Ensure the project root is on sys.path so `import config` works when this
 # file is run directly (e.g. `python core/assistant.py`).
@@ -51,6 +52,7 @@ from core.memory import (
 )
 from core.stt import STTEngine
 from core.tts import TTSEngine
+from core.typed_input import TypedInputBox
 from core.wake_word import WakeWordDetector
 import config
 
@@ -77,6 +79,26 @@ SEND_CONFIRM_SILENCE_TIMEOUT: float = 15.0
 # letter by letter takes a moment, and the boss may be switching to the
 # dashboard to type it instead of saying it.
 ADDRESS_ENTRY_SILENCE_TIMEOUT: float = 15.0
+
+# How long to wait after a TYPED turn before treating the conversation as over.
+# Longer than the spoken follow-up window for the same reason the send
+# confirmation is: composing a message is thinking, not reacting, and a typed
+# exchange has no natural "still talking" signal. The mic stays open through it
+# so a voice follow-up isn't delayed, and a typed one aborts it in ~32 ms.
+TYPED_FOLLOWUP_TIMEOUT: float = 20.0
+
+
+class TurnInput(NamedTuple):
+    """
+    One turn's input, and where it came from.
+
+    `typed` matters because silence means end-of-conversation while an aborted
+    listen does not: both come back from listen_and_transcribe() as "", so the
+    flag is what tells them apart. Genuine silence is text="" with typed=False.
+    """
+    text: str
+    typed: bool
+
 
 # Confidence threshold for the barge-in detector that listens WHILE Jarvis is
 # speaking, so the boss can cut off a long/wrong reply by saying the wake word.
@@ -273,6 +295,22 @@ class JarvisAssistant:
 
         self._email = EmailManager(on_new_mail=self._on_new_mail)
 
+        # Typed messages from the dashboard. The API thread fills the slot; the
+        # voice loop drains it, either to start a conversation (when idle) or as
+        # the next turn's input (mid-conversation).
+        self._typed = TypedInputBox(on_message=self._on_typed_message)
+
+        # When True, Jarvis answers silently: every speak path still emits its
+        # events (so the dashboard transcript is complete) but no audio plays.
+        # A plain unlocked bool, same as _state — one writer, torn reads are
+        # harmless. Deliberately on the assistant, not on TTSEngine: onboarding
+        # calls self._tts.speak() directly and must stay audible (see _speak).
+        self._muted = False
+
+        # Flipped once the heavy models are loaded, so GET /health can tell the
+        # dashboard "up but still loading" apart from "ready".
+        self._models_ready = False
+
         # The wake word detector callback just signals the main thread — it must
         # not do any heavy work itself to avoid blocking the detector's internal
         # thread.
@@ -357,6 +395,29 @@ class JarvisAssistant:
         """
         return self._email
 
+    def are_models_ready(self) -> bool:
+        """Whether Whisper/Kokoro have finished loading — lets the dashboard
+        distinguish "starting up" from "ready" on GET /health."""
+        return self._models_ready
+
+    def is_muted(self) -> bool:
+        """Whether spoken output is currently suppressed."""
+        return self._muted
+
+    def set_muted(self, muted: bool) -> None:
+        """Turn spoken output off/on. Takes effect from the next utterance;
+        anything already playing finishes (barge-in is the way to cut that short)."""
+        self._muted = bool(muted)
+        logger.info(f"Speech output {'muted' if self._muted else 'unmuted'}.")
+
+    def get_typed_input(self) -> TypedInputBox:
+        """
+        Exposes the single shared typed-message slot, for the same reason
+        get_email_manager()/get_memory() exist: POST /message must fill the very
+        slot this conversation loop drains, not a second copy of it.
+        """
+        return self._typed
+
     def get_memory(self) -> MemoryManager:
         """
         Exposes the single shared MemoryManager instance, for the same reason
@@ -406,6 +467,7 @@ class JarvisAssistant:
             logger.info("Loading Kokoro TTS model…")
             self._tts.initialize()
             logger.success("Kokoro TTS ready.")
+            self._models_ready = True
 
             logger.info("Loading memory store…")
             self._memory.load()
@@ -448,6 +510,25 @@ class JarvisAssistant:
                         self._spawn_conversation()
                         continue
 
+                    # A typed message outranks an announcement: it's something
+                    # the boss just explicitly asked for, whereas an
+                    # announcement is proactive and survives to a later pass
+                    # (claim_announcement re-applies its staleness filter).
+                    #
+                    # This check is also what makes typing-while-busy work at
+                    # all. _run_conversation's finally unconditionally clears
+                    # _wake_word_pending AND _wake_event, so a poke that lands
+                    # mid-conversation is swallowed — but the typed slot keeps
+                    # its own state, which that finally never touches. The loop
+                    # re-reads the slot here, above the wait(), so the message
+                    # is picked up the moment the conversation ends. Like the
+                    # announcement check, this MUST stay above wait().
+                    if self._typed.peek_pending():
+                        if not self._running:
+                            break
+                        self._spawn_conversation()
+                        continue
+
                     announcement = self._email.claim_announcement()
                     if announcement is not None:
                         if not self._running:
@@ -455,8 +536,9 @@ class JarvisAssistant:
                         self._spawn_conversation(announcement=announcement)
                         continue
 
-                    # Nothing pending - block until the wake word fires or a
-                    # new-mail poke wakes us to re-check for an announcement.
+                    # Nothing pending - block until the wake word fires, a
+                    # message is typed, or a new-mail poke wakes us to re-check
+                    # for an announcement.
                     self._wake_event.wait()
                     self._wake_event.clear()
                     if not self._running:
@@ -516,9 +598,13 @@ class JarvisAssistant:
         for question in ONBOARDING_QUESTIONS:
             self._tts.speak(question)
             logger.info(f"[Onboarding] Asked: '{question}'")
-            answer = self._stt.listen_and_transcribe(
-                initial_silence_timeout=ONBOARDING_SILENCE_TIMEOUT
-            )
+            # emit_events=False: onboarding deliberately emits nothing and
+            # doesn't touch self._state. Routing through the helper anyway means
+            # the answers can be TYPED, which matters on a machine whose mic
+            # isn't working yet — otherwise first run is unescapable.
+            answer = self._get_turn_input(
+                silence_timeout=ONBOARDING_SILENCE_TIMEOUT, emit_events=False
+            ).text
             logger.info(f"[Onboarding] Answer: '{answer.strip() or '(no answer)'}'")
             qa_pairs.append((question, answer.strip()))
 
@@ -628,12 +714,85 @@ class JarvisAssistant:
         stopped before returning, so the next STT listen has the microphone to
         itself — WakeWordDetector and STTEngine can't both hold the mic, but the
         detector listening during speaker output is fine (different device).
+
+        This is the single choke point for muting. Every spoken line in the app
+        reaches the speaker through here (the greeting, replies, and — via
+        _speak_confirmation — every email and memory sub-dialogue), so the one
+        guard below silences all of them while their events still fire.
+        Deliberate exception: _run_onboarding calls self._tts.speak() directly,
+        so first-run onboarding stays audible even when muted. That's correct —
+        a silent onboarding would ask five questions nobody could hear and
+        record five blank answers.
         """
+        if self._muted:
+            logger.info(f"[Muted] Not speaking: '{text[:60]}{'…' if len(text) > 60 else ''}'")
+            # True = "delivered as intended", NOT "interrupted". The turn loop
+            # treats False as barge-in and calls note_interrupted_reply(), which
+            # would otherwise tell Claude every single muted reply was cut off.
+            # Also skip the barge detector: there's no audio to interrupt, and
+            # starting it needlessly takes the mic.
+            return True
+
         self._barge_detector.start()
         try:
             return self._tts.speak(text)
         finally:
             self._barge_detector.stop()
+
+    def _get_turn_input(
+        self,
+        *,
+        silence_timeout: float | None = None,
+        hotwords: str | None = None,
+        emit_events: bool = True,
+    ) -> TurnInput:
+        """
+        Get the next thing the boss said OR typed — the single input path for
+        the whole assistant.
+
+        Anything that waits for the boss goes through here, or it can't be typed
+        to. That includes every sub-dialogue question (via _ask_and_listen), so
+        an entire email send can be completed by typing.
+
+        Order matters:
+          1. Drain the typed slot FIRST. If a message is already waiting we
+             return it without opening the mic at all — this is what makes
+             "typed while Jarvis was speaking or thinking" instant, since
+             listen_and_transcribe() clears the abort flag at entry and would
+             otherwise discard the interruption.
+          2. Otherwise listen. A message arriving mid-listen aborts the
+             recording (~32 ms) and comes back as a blank transcript.
+          3. Re-drain, but ONLY when the transcript is blank. If real speech and
+             a typed message both landed, the speech wins and the message stays
+             queued for the next turn — never lost, never two user messages in
+             one turn.
+
+        Returns TurnInput(text, typed). Genuine silence is text="" and
+        typed=False, which callers still treat as end-of-conversation.
+        """
+        typed = self._typed.claim()
+        if typed is not None:
+            logger.info(f"[Typed] '{typed[:80]}{'…' if len(typed) > 80 else ''}'")
+            return TurnInput(typed, True)
+
+        if emit_events:
+            self._set_state(AssistantState.LISTENING)
+            self._emit_event("listening_started")
+
+        text = self._stt.listen_and_transcribe(
+            initial_silence_timeout=(
+                silence_timeout if silence_timeout is not None else FOLLOWUP_SILENCE_TIMEOUT
+            ),
+            hotwords=hotwords,
+        )
+
+        if not text.strip():
+            typed = self._typed.claim()
+            if typed is not None:
+                logger.info(f"[Typed] '{typed[:80]}{'…' if len(typed) > 80 else ''}'")
+                return TurnInput(typed, True)
+
+        return TurnInput(text, False)
 
     def _speak_confirmation(self, reply: str) -> None:
         """
@@ -667,17 +826,20 @@ class JarvisAssistant:
 
         `hotwords` biases STT decoding toward an expected vocabulary — pass it
         when the answer is drawn from a known set (account names, contacts).
+
+        The answer may be SPOKEN OR TYPED: routing through _get_turn_input is
+        what lets the boss finish a sub-dialogue (a whole email send, say) from
+        the keyboard. The state/event emits live in the helper, so the typed
+        path never claims a mic window it didn't open.
         """
         self._speak_confirmation(question)
-        self._set_state(AssistantState.LISTENING)
-        self._emit_event("listening_started")
-        answer = self._stt.listen_and_transcribe(
-            initial_silence_timeout=silence_timeout, hotwords=hotwords
-        )
-        if answer.strip():
-            logger.info(f"[Clarifying answer] '{answer}'")
-            self._emit_event("transcription", text=answer)
-        return answer
+        turn = self._get_turn_input(silence_timeout=silence_timeout, hotwords=hotwords)
+        if turn.text.strip():
+            logger.info(f"[Clarifying answer] '{turn.text}'")
+            self._emit_event(
+                "transcription", text=turn.text, source="typed" if turn.typed else "voice"
+            )
+        return turn.text
 
     def _handle_explicit_memory(self, explicit_fact: str) -> None:
         """
@@ -1920,6 +2082,22 @@ class JarvisAssistant:
         self._wake_word_pending = True
         self._wake_event.set()
 
+    def _on_typed_message(self) -> None:
+        """
+        Called by TypedInputBox from the API thread the moment a message is
+        queued. Like _on_wake_word/_on_new_mail it must not block.
+
+        Two pokes, for the two situations:
+          * _wake_event — wakes the dispatch loop when Jarvis is idle, so the
+            message starts a conversation.
+          * _stt.request_abort() — cuts short a listen already in progress, so a
+            mid-conversation message lands in ~32 ms instead of waiting out the
+            silence timeout. Harmless when nothing is recording (the flag is
+            cleared at the start of every listen).
+        """
+        self._stt.request_abort()
+        self._wake_event.set()
+
     def _on_new_mail(self) -> None:
         """
         Called by EmailManager (from the poll thread) when a cycle finds new
@@ -2012,41 +2190,44 @@ class JarvisAssistant:
                 self._speak("Hey, how can I help you today?")
 
             first_turn = True
+            last_was_typed = False
 
             while True:
-                # ── 3a. Listen and transcribe ─────────────────────────────────
-                self._set_state(AssistantState.LISTENING)
-                self._emit_event("listening_started")
-
+                # ── 3a. Get the next input — spoken OR typed ──────────────────
+                # _get_turn_input owns the LISTENING state and listening_started
+                # emit, so a message already waiting is returned without
+                # opening (or claiming to open) the mic.
                 if first_turn and announcement is None:
-                    logger.info("[Listening] Speak now…")
-                    text = self._stt.listen_and_transcribe()
-                elif first_turn:
-                    logger.info(
-                        f"[Listening after announcement] Speak within "
-                        f"{FOLLOWUP_SILENCE_TIMEOUT:.0f}s or stay silent to end…"
-                    )
-                    text = self._stt.listen_and_transcribe(
-                        initial_silence_timeout=FOLLOWUP_SILENCE_TIMEOUT
-                    )
+                    # STT's own default: the boss just woke Jarvis, or typed.
+                    silence_timeout = None
+                    logger.info("[Waiting for input] Speak or type now…")
                 else:
-                    logger.info(
-                        f"[Listening for follow-up] "
-                        f"Speak within {FOLLOWUP_SILENCE_TIMEOUT:.0f}s or stay silent to end…"
+                    # After a typed turn, wait longer — composing takes longer
+                    # than answering out loud.
+                    silence_timeout = (
+                        TYPED_FOLLOWUP_TIMEOUT if last_was_typed else FOLLOWUP_SILENCE_TIMEOUT
                     )
-                    text = self._stt.listen_and_transcribe(
-                        initial_silence_timeout=FOLLOWUP_SILENCE_TIMEOUT
+                    logger.info(
+                        f"[Waiting for follow-up] Speak or type within "
+                        f"{silence_timeout:.0f}s, or stay silent to end…"
                     )
 
+                turn = self._get_turn_input(silence_timeout=silence_timeout)
+                text, last_was_typed = turn.text, turn.typed
                 first_turn = False
 
-                # ── 3b. Nothing transcribed → end conversation ────────────────
+                # ── 3b. Nothing said and nothing typed → end conversation ─────
+                # An aborted listen also returns "" — but only ever because a
+                # typed message arrived, and _get_turn_input has already
+                # returned that message with typed=True, so it can't land here.
                 if not text.strip():
-                    logger.info("[Conversation ended] No speech detected.")
+                    logger.info("[Conversation ended] No speech or typed input detected.")
                     break
 
-                logger.info(f"[Transcribed] '{text}'")
-                self._emit_event("transcription", text=text)
+                logger.info(f"[{'Typed' if last_was_typed else 'Transcribed'}] '{text}'")
+                self._emit_event(
+                    "transcription", text=text, source="typed" if last_was_typed else "voice"
+                )
 
                 # ── 3c. Explicit memory command? ("remember that...") ─────────
                 # Replaces the normal get_response() step entirely for this turn.
@@ -2145,6 +2326,9 @@ class JarvisAssistant:
         self._stop_requested = True  # honored by run() if it's still starting up
         self._running = False
         self._wake_event.set()  # unblock wait() if sleeping
+
+        # Drop any queued message so it can't surface in a later session.
+        self._typed.clear()
 
         with self._shutdown_lock:
             logger.info("Stopping wake detector…")

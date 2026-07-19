@@ -16,6 +16,7 @@ import {
   type JarvisEventType
 } from '@/services/backendClient'
 import { voiceService } from '@/services/voiceService'
+import { getStoredMuted, setStoredMuted } from '@/services/speech'
 import type { VoiceState } from '@/services/types'
 
 export interface TranscriptEntry {
@@ -42,16 +43,22 @@ interface BackendContextValue {
   recentEvents: VoiceEventEntry[]
   error: string | null
   pendingContact: { name: string } | null
+  muted: boolean
   toggleAssistant: () => Promise<void>
   startAssistant: () => Promise<void>
   stopAssistant: () => Promise<void>
   submitContactEmail: (email: string) => Promise<void>
+  sendMessage: (text: string) => Promise<void>
+  setMuted: (muted: boolean) => Promise<void>
 }
 
 const BackendContext = createContext<BackendContextValue | null>(null)
 
 const MAX_EVENTS = 20
-const MAX_TRANSCRIPT = 2
+// Enough to scroll back through a real conversation. This was 2, which made the
+// transcript a two-line window — fine when the only input was voice, useless now
+// that it doubles as a chat log.
+const MAX_TRANSCRIPT = 50
 
 function formatEventLabel(event: JarvisBackendEvent): string {
   switch (event.event) {
@@ -90,8 +97,8 @@ export function BackendProvider({ children }: { children: ReactNode }) {
   const [recentEvents, setRecentEvents] = useState<VoiceEventEntry[]>([])
   const [error, setError] = useState<string | null>(null)
   const [pendingContact, setPendingContact] = useState<{ name: string } | null>(null)
+  const [muted, setMutedState] = useState(getStoredMuted)
   const voiceStateRef = useRef<VoiceState>('idle')
-  const turnCountRef = useRef(0)
 
   const pushEvent = useCallback((event: JarvisBackendEvent) => {
     setRecentEvents((prev) => {
@@ -115,12 +122,11 @@ export function BackendProvider({ children }: { children: ReactNode }) {
       voiceService.syncState(nextState)
 
       if (event.event === 'transcription' && event.text) {
-        turnCountRef.current += 1
         setTranscript((prev) => [
           ...prev,
           {
-            id: `user-${Date.now()}`,
-            role: 'user',
+            id: `user-${Date.now()}-${prev.length}`,
+            role: 'user' as const,
             text: event.text!,
             timestamp: new Date()
           }
@@ -131,8 +137,8 @@ export function BackendProvider({ children }: { children: ReactNode }) {
         setTranscript((prev) => [
           ...prev,
           {
-            id: `assistant-${Date.now()}`,
-            role: 'assistant',
+            id: `assistant-${Date.now()}-${prev.length}`,
+            role: 'assistant' as const,
             text: event.text!,
             timestamp: new Date()
           }
@@ -214,6 +220,11 @@ export function BackendProvider({ children }: { children: ReactNode }) {
         void bootstrap()
         void refreshStatus()
         void backendClient.getPendingContact().then(setPendingContact)
+        // The backend starts every process unmuted, so push the stored
+        // preference back at it on each (re)connect.
+        const preferred = getStoredMuted()
+        if (preferred) void backendClient.setMuted(true).catch(() => undefined)
+        setMutedState(preferred)
         setError(null)
       }
     })
@@ -253,6 +264,23 @@ export function BackendProvider({ children }: { children: ReactNode }) {
     await backendClient.submitContactEmail(email)
   }, [])
 
+  const sendMessage = useCallback(async (text: string) => {
+    // No optimistic echo: the backend answers with a `transcription` event,
+    // which is what renders the user bubble. Echoing here would double it.
+    await backendClient.sendMessage(text)
+  }, [])
+
+  const setMuted = useCallback(async (next: boolean) => {
+    // Store the preference first so it survives even if the backend is down.
+    setStoredMuted(next)
+    setMutedState(next)
+    try {
+      await backendClient.setMuted(next)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to change speech setting')
+    }
+  }, [])
+
   const toggleAssistant = useCallback(async () => {
     if (running) await stopAssistant()
     else await startAssistant()
@@ -269,10 +297,13 @@ export function BackendProvider({ children }: { children: ReactNode }) {
       recentEvents,
       error,
       pendingContact,
+      muted,
       toggleAssistant,
       startAssistant,
       stopAssistant,
-      submitContactEmail
+      submitContactEmail,
+      sendMessage,
+      setMuted
     }),
     [
       connected,
@@ -284,10 +315,13 @@ export function BackendProvider({ children }: { children: ReactNode }) {
       recentEvents,
       error,
       pendingContact,
+      muted,
       toggleAssistant,
       startAssistant,
       stopAssistant,
-      submitContactEmail
+      submitContactEmail,
+      sendMessage,
+      setMuted
     ]
   )
 

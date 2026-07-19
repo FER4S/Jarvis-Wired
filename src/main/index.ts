@@ -1,8 +1,8 @@
 import { app, BrowserWindow, shell, ipcMain } from 'electron'
 import { join } from 'path'
 import { spawn, type ChildProcess } from 'child_process'
-import { existsSync } from 'fs'
-import { randomBytes } from 'crypto'
+import { existsSync, readFileSync } from 'fs'
+import { createHash, randomBytes } from 'crypto'
 
 const BACKEND_URL = process.env.JARVIS_BACKEND_URL ?? 'http://127.0.0.1:8000'
 const BACKEND_PORT = new URL(BACKEND_URL).port || '8000'
@@ -26,30 +26,71 @@ function runtimePython(): string {
     : join(root, 'runtime', 'bin', 'python3')
 }
 
+// The provisioned dependencies live OUTSIDE the install folder, because the
+// installer wipes $INSTDIR on every update (see backend/provision.py's module
+// docstring). Keep this in sync with provision.py's pydeps_root().
+function pydepsRoot(): string {
+  // %LOCALAPPDATA%, NOT %APPDATA%: the latter roams, and an 8.4 GB roaming
+  // profile is a bad outcome on a managed machine. Must stay identical to
+  // provision.py's pydeps_root().
+  const base = process.env.LOCALAPPDATA ?? app.getPath('appData')
+  return join(base, 'Jarvis', 'pydeps')
+}
+
+function pydepsPython(): string {
+  return process.platform === 'win32'
+    ? join(pydepsRoot(), 'Scripts', 'python.exe')
+    : join(pydepsRoot(), 'bin', 'python')
+}
+
 function resolveBackendPaths(): { python: string; script: string; cwd: string } {
   const appRoot = backendRoot()
   const isWin = process.platform === 'win32'
-  // Preferred: a self-contained Python runtime shipped with the app (backend/runtime),
-  // so the boss needs no system Python. Fall back to a local dev venv, then system python.
+  // Preferred: the provisioned venv (holds torch et al, survives updates). Then
+  // the bundled runtime, then a local dev venv, then system python. The backend
+  // SOURCE always comes from the install folder — only the interpreter moves.
   const candidates = isWin
-    ? [join(appRoot, 'runtime', 'python.exe'), join(appRoot, '.venv', 'Scripts', 'python.exe')]
-    : [join(appRoot, 'runtime', 'bin', 'python3'), join(appRoot, '.venv', 'bin', 'python')]
+    ? [
+        pydepsPython(),
+        join(appRoot, 'runtime', 'python.exe'),
+        join(appRoot, '.venv', 'Scripts', 'python.exe')
+      ]
+    : [
+        pydepsPython(),
+        join(appRoot, 'runtime', 'bin', 'python3'),
+        join(appRoot, '.venv', 'bin', 'python')
+      ]
   const python = candidates.find((p) => existsSync(p)) ?? (isWin ? 'python' : 'python3')
   return { python, script: join(appRoot, 'main.py'), cwd: appRoot }
 }
 
-// First-run setup is needed when we ship the bundled runtime but its heavy deps
-// haven't been installed yet (no marker). With no bundled runtime (pure dev with a
-// .venv), there's nothing to provision.
+// First-run setup is needed when we ship the bundled runtime but the dependency
+// venv isn't there or doesn't match the shipped lock file. With no bundled
+// runtime (pure dev with a .venv), there's nothing to provision.
+//
+// The lock-hash comparison is what makes updates cheap: an unchanged dependency
+// list means the existing venv is reused as-is and no setup screen appears.
 function needsProvision(): boolean {
   if (!existsSync(runtimePython())) return false
-  return !existsSync(join(backendRoot(), 'runtime', '.provisioned'))
+  if (!existsSync(pydepsPython())) return true
+
+  try {
+    const stamp = JSON.parse(readFileSync(join(pydepsRoot(), '.provisioned'), 'utf-8'))
+    const lock = readFileSync(join(backendRoot(), 'requirements-lock.txt'))
+    const lockHash = createHash('sha256').update(lock).digest('hex')
+    return stamp?.lock_sha256 !== lockHash
+  } catch {
+    return true // missing/unreadable stamp -> provision
+  }
 }
 
 function childEnv(): NodeJS.ProcessEnv {
   return {
     ...process.env,
     JARVIS_DATA_DIR: join(app.getPath('appData'), 'Jarvis', 'data'),
+    // Recorded in the provisioning stamp for diagnostics (not used to decide
+    // whether to re-provision — that's the lock hash).
+    JARVIS_APP_VERSION: app.getVersion(),
     // Force UTF-8 so the backend's emoji log lines aren't mangled when captured
     // on a non-UTF-8 Windows locale.
     PYTHONUTF8: '1',
@@ -159,7 +200,11 @@ function createWindow(): void {
       sandbox: false,
       contextIsolation: true,
       nodeIntegration: false,
-      additionalArguments: [`--jarvis-backend-url=${BACKEND_URL}`, `--jarvis-backend-token=${BACKEND_TOKEN}`]
+      additionalArguments: [
+        `--jarvis-backend-url=${BACKEND_URL}`,
+        `--jarvis-backend-token=${BACKEND_TOKEN}`,
+        `--jarvis-app-version=${app.getVersion()}`
+      ]
     }
   })
 

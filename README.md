@@ -10,6 +10,10 @@ desktop UI and shipped as a **one-click Windows installer**.
 
 Everything runs on-device except the Claude API call.
 
+You can talk to it or **type** to it (a message box under the conversation, usable even mid-sentence),
+**mute** its spoken replies, interrupt it by saying the wake word, and read or edit everything it
+remembers from the Account tab. See [CHANGELOG.md](CHANGELOG.md) for what's new.
+
 ## Run in development
 
 ```bash

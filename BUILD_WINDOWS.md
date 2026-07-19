@@ -42,20 +42,33 @@ see "Runtime states". Then verify: UI reaches **Online**; `Ctrl+Space` toggles t
 (proves the auth token); "Hey Jarvis" → transcript + spoken reply; "remember that…" + an email
 question prove memory + email are live. Data lands in `%APPDATA%\Jarvis\data` (NOT `backend/data/`).
 
-### Runtime states — the ONE thing to understand
-`backend/runtime/`'s state drives everything:
+### Where the deps live — the ONE thing to understand (CHANGED in 1.1)
 
-| State | Contents | Behavior |
+The bundled `backend/runtime/` is now **only a bootstrap interpreter**. The actual dependencies live
+in a venv at **`%LOCALAPPDATA%\Jarvis\pydeps`**, outside the install folder.
+
+Why: a one-click update runs the old uninstaller first, which does `RMDir /r $INSTDIR` — everything
+under the install dir is destroyed on **every** update. With ~8.4 GB of packages in there, each
+update cost a ~4 GB re-download (the pip *wheel* cache is empty in practice; only the ~3.5 GB HF
+model cache survives by itself). Outside it, an update touches them at all.
+
+| Thing | Where | Survives an update? |
 |---|---|---|
-| **Slim** (what SHIPS) | standalone python + pip only (~58 MB), **no** `.provisioned` marker | App shows the **setup screen** and provisions on launch |
-| **Full** (for dev)   | slim + all deps + `.provisioned` marker | App skips setup; backend runs immediately |
+| Bootstrap runtime (ships, ~58 MB) | `resources\backend\runtime\` | replaced with the new one |
+| Installed dependencies (~8.4 GB) | `%LOCALAPPDATA%\Jarvis\pydeps\` | **yes** |
+| Provisioning stamp | `%LOCALAPPDATA%\Jarvis\pydeps\.provisioned` | **yes** |
+| Memory + email accounts | `%APPDATA%\Jarvis\data\` | **yes** |
 
-- **Make it full (for dev):** with a slim runtime present, just run the provisioner once —
-  `cd backend; runtime\python.exe provision.py` — it pip-installs the deps, downloads models, and
-  writes the marker (exactly what the boss's first run does). ~4–5 GB first time; cached after.
-- **Make it slim (before building):** Part 2.1.
-- `resolveBackendPaths()` prefers `backend/runtime`, then `backend/.venv`, then system python — so
-  a slim runtime *always* triggers setup. Delete `backend/runtime` to fall back to a dev `.venv`.
+- **The stamp, not a marker.** It's JSON: `{schema, app_version, lock_sha256, python, created_at}`.
+  `needsProvision()` (Electron) and `deps_current()` (provision.py) both compare `lock_sha256`
+  against the shipped `requirements-lock.txt`. Unchanged lock → no setup screen at all. Changed lock
+  → reinstall. This is what makes an update near-instant.
+- **Provision for dev:** `cd backend; runtime\python.exe provision.py` — builds the venv, installs
+  deps, downloads models, writes the stamp (exactly what the boss's first run does).
+- `resolveBackendPaths()` prefers `pydeps\Scripts\python.exe`, then `backend/runtime`, then
+  `backend/.venv`, then system python. The backend *source* always comes from the install folder —
+  only the interpreter moves.
+- **Force a re-provision:** delete `%LOCALAPPDATA%\Jarvis\pydeps`.
 
 ---
 
@@ -123,22 +136,26 @@ It's too big for email — use **Google Drive / WeTransfer / Dropbox**.
 ## Part 4 — Where it installs / how to open + debug
 - **Install dir:** `%LOCALAPPDATA%\Programs\jarvis-command-center\` (exe `JARVIS Command Center.exe`;
   bundled backend at `resources\backend\`, provisioner at `resources\backend\provision.py`).
-- **Open via Start Menu → "JARVIS Command Center".** Do **NOT** re-run `Setup.exe` to open it —
-  that reinstalls and re-triggers setup (wipes the runtime deps + `.provisioned` marker;
-  re-provisioning is fast from cache, but it's not how you launch).
+- **Open via Start Menu → "JARVIS Command Center".** Re-running `Setup.exe` is now *safe* (since 1.1
+  the deps live outside `$INSTDIR`, so a reinstall keeps them and the stamp still matches → no setup
+  screen) — but it's still not how you launch the app.
 - **Quick fix without rebuilding:** edit the *installed* `resources\backend\provision.py` directly
   and hit **Retry** on the setup screen (that's how the `--break-system-packages` fix was validated
   live before rebuilding).
 - **Reset a machine's memory/accounts:** delete `%APPDATA%\Jarvis\data`.
-- **Caches (survive reinstalls):** pip wheels in `%LOCALAPPDATA%\pip\Cache`; models in the Hugging
-  Face cache under `%USERPROFILE%`. This is why re-provisioning after a reinstall is fast.
+- **Caches (survive reinstalls):** models in the Hugging Face cache under `%USERPROFILE%` (~3.5 GB —
+  this is real and is why model downloads are skipped). The pip *wheel* cache at
+  `%LOCALAPPDATA%\pip\Cache` is mostly index metadata in practice (`wheels/` was 0 bytes when
+  measured), so don't count on it to make a re-provision cheap — the persistent `pydeps` venv is
+  what actually does that now.
 
 ---
 
 ## Part 5 — Critical gotchas (we hit ALL of these — don't re-break)
-1. **`--break-system-packages`** is REQUIRED in `provision.py`'s pip call — the standalone Python is
-   PEP-668 "externally managed" and pip refuses to install into it otherwise (error:
-   `externally-managed-environment`).
+1. **`--break-system-packages`** is kept in `provision.py`'s pip call. Since 1.1 the install target is
+   a venv, which has no PEP-668 marker, so it's no longer strictly required — it stays so the same
+   command still works if we ever install into the bundled runtime directly again (which *is*
+   "externally managed" and would otherwise refuse with `externally-managed-environment`).
 2. **`files: ["out/**","package.json"]`** — without it, electron-builder packs the whole project
    (incl. `backend/.venv`, 8 GB) into `app.asar` → 8 GB `.7z` → 32-bit makensis "failed creating
    mmap" → build fails.
@@ -146,8 +163,23 @@ It's too big for email — use **Google Drive / WeTransfer / Dropbox**.
    makensis.
 4. **Torch pin** — the lock must be `torch==2.7.1+cu128` (from `--index-url .../whl/cu128`), not the
    `file://` path `pip freeze` emits.
-5. `provision.py` writes `backend/runtime/.provisioned` on success; delete it (or the deps) to force
-   re-setup.
+5. `provision.py` writes the stamp to `%LOCALAPPDATA%\Jarvis\pydeps\.provisioned` on success; delete
+   that folder to force re-setup. (It is no longer inside `backend/runtime`.)
+6. **`build/installer.nsh` uses `customInit`, NOT `preInit`.** `preInit` runs before `initMultiUser`
+   resolves `$INSTDIR` from `HKCU\Software\<APP_GUID>\InstallLocation`, so the migration would look
+   in the wrong place. `customInit` runs right after it and still well before the old uninstaller.
+   electron-builder picks the file up automatically (`nsis.include` defaults to that path) — no
+   `package.json` change needed.
+7. **The migration is a same-volume `Rename`, never a copy.** `%LOCALAPPDATA%` and `$INSTDIR` are both
+   on C:, so it's an instant `MoveFile` regardless of 8.4 GB. Never add a copy fallback: it would
+   take many minutes inside `.onInit` with no progress UI and look exactly like a hang.
+8. **Bump `requirements-lock.txt` whenever you bump the bundled Python.** The stamp records the
+   Python version and `provision.py` rebuilds on a minor change, but Electron's `needsProvision()`
+   only compares the lock hash — and `cp310` wheels won't load on 3.11. They travel together anyway
+   (a Python bump changes every wheel's ABI tag, so the resolved lock changes).
+9. **Known non-issue:** `import pip` followed by `import setuptools` raises inside `_distutils_hack`.
+   It does that in a *pristine* venv built from the bundled runtime too — pre-existing, unrelated to
+   the deps relocation, and nothing in the app imports that pair. Don't go chasing it.
 
 ---
 

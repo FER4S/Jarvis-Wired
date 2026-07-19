@@ -9,6 +9,7 @@ import { EmailPage } from '@/pages/EmailPage'
 import { SystemControlPage } from '@/pages/SystemControlPage'
 import { AccountPage } from '@/pages/AccountPage'
 import { useVoiceActions } from '@/hooks/useVoiceState'
+import { getAppVersion, markVersionSeen } from '@/services/release'
 
 function AppRoutes() {
   const voiceActions = useVoiceActions()
@@ -16,6 +17,18 @@ function AppRoutes() {
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.code === 'Space' && e.ctrlKey) {
+        // Don't hijack the shortcut while the boss is typing a message —
+        // Ctrl+Space in the conversation box would otherwise stop the assistant
+        // mid-sentence.
+        const target = e.target as HTMLElement | null
+        if (
+          target &&
+          (target.tagName === 'INPUT' ||
+            target.tagName === 'TEXTAREA' ||
+            target.isContentEditable)
+        ) {
+          return
+        }
         e.preventDefault()
         void voiceActions.toggleListening()
       }
@@ -57,10 +70,18 @@ export default function App() {
     }
   }, [])
 
+  // First run on a brand-new machine: there is no "before", so record the
+  // current version silently instead of popping release notes at someone who
+  // has never seen the app. Only a genuine update should show What's New.
+  const handleSetupComplete = () => {
+    markVersionSeen(getAppVersion())
+    setPhase('ready')
+  }
+
   return (
     <ThemeProvider>
       {phase === 'checking' ? null : phase === 'setup' ? (
-        <SetupScreen onComplete={() => setPhase('ready')} />
+        <SetupScreen onComplete={handleSetupComplete} />
       ) : (
         <BackendProvider>
           <AppRoutes />

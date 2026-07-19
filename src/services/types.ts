@@ -270,6 +270,9 @@ export interface IVoiceService {
   getFrequencyData(): Uint8Array
   onStateChange(cb: (state: VoiceState) => void): () => void
   onAmplitudeChange(cb: (amplitude: number) => void): () => void
+  /** Drive the visualiser from a backend event. Implemented by VoiceService but
+   *  previously missing here, which made every call site a type error. */
+  syncState(state: VoiceState): void
 }
 
 declare global {

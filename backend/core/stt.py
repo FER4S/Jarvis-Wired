@@ -22,6 +22,7 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 import math
+import threading
 import time
 from typing import Optional
 
@@ -31,17 +32,64 @@ from loguru import logger
 
 # ── Fix for Windows CUDA DLLs ─────────────────────────────────────────────────
 # Windows Python 3.8+ no longer uses PATH for DLL resolution. The nvidia-* pip
-# packages place their DLLs in site-packages/nvidia/*/bin. We must add them manually.
+# packages place their DLLs in site-packages/nvidia/*/bin, so they have to be
+# registered by hand.
+#
+# Every plausible site-packages root is scanned, not just sys.prefix: the
+# packaged app runs from a venv at %LOCALAPPDATA%\Jarvis\pydeps, dev runs from
+# backend/.venv, and a bare `python main.py` runs from the system install. A
+# missed root doesn't error — CUDA simply fails to load and faster-whisper
+# silently falls back to CPU, which on a 5090 is a very expensive kind of quiet.
+# Hence the warning at the end.
 if os.name == "nt":
+    import site
+    import sysconfig
     from pathlib import Path
-    _site_packages = Path(sys.prefix) / "Lib" / "site-packages"
-    for _dll_path in _site_packages.glob("nvidia/*/bin"):
-        if _dll_path.is_dir():
-            try:
-                os.add_dll_directory(str(_dll_path))
-                logger.info(f"Added CUDA DLL path: {_dll_path}")
-            except Exception as e:
-                logger.error(f"Failed to add DLL path {_dll_path}: {e}")
+
+    _roots: list[str] = []
+    try:
+        _roots.extend(site.getsitepackages())
+    except Exception:
+        pass
+    try:
+        _roots.append(site.getusersitepackages())
+    except Exception:
+        pass
+    _roots.append(sysconfig.get_paths().get("purelib", ""))
+    _roots.append(str(Path(sys.prefix) / "Lib" / "site-packages"))  # historical behaviour
+    _roots.extend(p for p in sys.path if p)                          # --target / PYTHONPATH layouts
+
+    _seen: set[str] = set()
+    _added = 0
+    for _root in _roots:
+        if not _root:
+            continue
+        _key = os.path.normcase(os.path.abspath(_root))
+        if _key in _seen:
+            continue
+        _seen.add(_key)
+        try:
+            for _dll_path in Path(_root).glob("nvidia/*/bin"):
+                if not _dll_path.is_dir():
+                    continue
+                _dll_key = os.path.normcase(str(_dll_path))
+                if _dll_key in _seen:
+                    continue
+                _seen.add(_dll_key)
+                try:
+                    os.add_dll_directory(str(_dll_path))
+                    _added += 1
+                    logger.info(f"Added CUDA DLL path: {_dll_path}")
+                except Exception as e:
+                    logger.error(f"Failed to add DLL path {_dll_path}: {e}")
+        except Exception:
+            continue  # unreadable path on sys.path — ignore
+
+    if _added == 0:
+        logger.warning(
+            "No CUDA DLL directories found (looked for nvidia/*/bin in every "
+            "site-packages root). GPU transcription will likely fall back to CPU."
+        )
 # ──────────────────────────────────────────────────────────────────────────────
 
 from faster_whisper import WhisperModel
@@ -99,6 +147,10 @@ class STTEngine:
         self._language = language
         self._mic_device_index = mic_device_index
         self._model: Optional[WhisperModel] = None
+        # Set by request_abort() to cut a recording short — used when a typed
+        # message arrives and there is no point waiting out the silence timeout.
+        # Mirrors TTSEngine's _stop_event; see request_abort() for the contract.
+        self._abort_event: threading.Event = threading.Event()
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -144,6 +196,22 @@ class STTEngine:
             else:
                 raise
 
+    def request_abort(self) -> None:
+        """
+        Ask an in-flight listen to stop recording as soon as possible.
+
+        Sets a flag only; the recording thread notices within one ~32 ms chunk.
+        Mirrors TTSEngine.request_stop() — and like it, deliberately touches no
+        audio state from the caller's thread.
+
+        IMPORTANT — the return contract does NOT change: an aborted listen
+        returns "" exactly like silence does. That keeps every existing caller
+        and stub working. The caller tells the two apart by checking whatever
+        supplied the interruption (the typed-message slot); see
+        JarvisAssistant._get_turn_input.
+        """
+        self._abort_event.set()
+
     def listen_and_transcribe(
         self,
         initial_silence_timeout: float = SILENCE_DURATION_S,
@@ -171,6 +239,10 @@ class STTEngine:
         """
         if self._model is None:
             raise RuntimeError("Model not loaded. Call load_model() first.")
+
+        # An abort left over from a previous listen must not kill this one
+        # (same reason TTSEngine.speak() clears its stop event at entry).
+        self._abort_event.clear()
 
         logger.info("Listening…")
         audio_data = self._record_until_silence(
@@ -238,6 +310,16 @@ class STTEngine:
             )
 
             for _ in range(max_chunks):
+                # Cut the recording short when a typed message arrives — no
+                # point holding the mic for the rest of the silence timeout.
+                # ~32 ms granularity (one chunk); the caller distinguishes this
+                # from real silence by checking the typed slot (see
+                # JarvisAssistant._get_turn_input).
+                if self._abort_event.is_set():
+                    logger.debug("Recording aborted — input arrived from elsewhere.")
+                    frames.clear()
+                    break
+
                 chunk = stream.read(CHUNK_SAMPLES, exception_on_overflow=False)
                 frames.append(chunk)
 
@@ -294,9 +376,15 @@ class STTEngine:
         rms_values: list[float] = []
 
         for _ in range(max(calibration_chunks, 5)):
+            # Honor an abort here too: without it, a message typed the instant a
+            # listen begins still waits out the full calibration burst.
+            if self._abort_event.is_set():
+                break
             chunk = stream.read(CHUNK_SAMPLES, exception_on_overflow=False)
             rms_values.append(self._compute_rms(chunk))
 
+        if not rms_values:  # aborted before any chunk was read
+            return 50.0
         ambient_rms = sum(rms_values) / len(rms_values)
         threshold = max(ambient_rms * SILENCE_MULTIPLIER, 50.0)  # 50 = sane minimum
         return threshold

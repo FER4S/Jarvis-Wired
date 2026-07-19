@@ -18,10 +18,12 @@ import {
   getToken,
   setStoredCredentials
 } from '@/services/backendClient'
+import { ReleaseNotes } from '@/components/release/ReleaseNotes'
+import { CHANGELOG } from '@/data/changelog'
 import type { MemoryProfile, MemorySnapshot } from '@/services/types'
 import { BrutalInput, brutalBtnClass } from '@/components/ui/BrutalInput'
 
-const TABS = ['Profile', 'People', 'Knowledge', 'Import', 'Connection'] as const
+const TABS = ['Profile', 'People', 'Knowledge', 'Import', "What's New", 'Connection'] as const
 type Tab = (typeof TABS)[number]
 
 function getInitialApiUrl(): string {
@@ -209,7 +211,7 @@ export function AccountPage() {
         </p>
       )}
 
-      {loading && tab !== 'Connection' ? (
+      {loading && tab !== 'Connection' && tab !== "What's New" ? (
         <p className="font-mono text-xs t-text-muted uppercase">Loading memory…</p>
       ) : (
         <>
@@ -283,6 +285,24 @@ export function AccountPage() {
                 }, 'Event deleted.')
               }
             />
+          )}
+
+          {tab === "What's New" && (
+            <div className="flex flex-col gap-4">
+              {CHANGELOG.map((release) => (
+                <BrutalPanel
+                  key={release.version}
+                  panelId={`V${release.version}`}
+                  title={`Version ${release.version} — ${release.date}`}
+                  fillHeight={false}
+                >
+                  <div className="flex flex-col gap-4">
+                    <p className="font-sans text-sm t-text leading-relaxed">{release.headline}</p>
+                    <ReleaseNotes release={release} />
+                  </div>
+                </BrutalPanel>
+              ))}
+            </div>
           )}
 
           {tab === 'Import' && (

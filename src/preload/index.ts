@@ -6,6 +6,12 @@ const backendUrl = backendUrlArg?.split('=')[1] ?? 'http://127.0.0.1:8000'
 const backendTokenArg = process.argv.find((arg) => arg.startsWith('--jarvis-backend-token='))
 const backendToken = backendTokenArg?.split('=')[1] ?? ''
 
+// Injected by main from app.getVersion(), the same way the backend URL and
+// token are. Keeps `version` a synchronous string for the renderer (it drives
+// the "What's new" gate) instead of an async IPC call.
+const appVersionArg = process.argv.find((arg) => arg.startsWith('--jarvis-app-version='))
+const appVersion = appVersionArg?.split('=')[1] ?? '0.0.0'
+
 export interface SetupProgress {
   pct: number
   phase: string
@@ -43,7 +49,7 @@ function subscribe<T>(channel: string, cb: (payload: T) => void): () => void {
 
 const jarvisApi: JarvisApi = {
   platform: process.platform,
-  version: '3.0.0',
+  version: appVersion,
   backend: {
     url: backendUrl,
     token: backendToken

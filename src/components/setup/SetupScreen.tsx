@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { LATEST } from '@/data/changelog'
 
 interface SetupScreenProps {
   onComplete: () => void
@@ -78,8 +79,30 @@ export function SetupScreen({ onComplete }: SetupScreenProps) {
             />
           </div>
           <div className="mt-2 flex items-center justify-between text-sm">
-            <span className="text-[var(--text-secondary,#b9c6da)]">{progress.detail}</span>
+            <span className="text-[var(--text-secondary,#b9c6da)]">
+              {progress.phase === 'models' ? 'Downloading voice models' : 'Installing components'}
+              {progress.detail ? ` — ${progress.detail}` : ''}
+            </span>
             <span className="tabular-nums text-[var(--cyan-bright,#7dd3fc)]">{progress.pct}%</span>
+          </div>
+        </div>
+
+        {/* Setup takes 15-40 minutes. Give him the release notes to read rather
+            than a progress bar to stare at. Framed "What's new in X" so it also
+            reads correctly on a brand-new install. */}
+        <div className="no-drag [-webkit-app-region:no-drag] mt-6 max-h-56 overflow-y-auto rounded-lg border border-[var(--border,#1e2c40)] bg-[var(--bg-surface,#0e1826)] p-4">
+          <p className="text-sm font-semibold text-[var(--text-primary,#e5eefc)]">
+            What&apos;s new in {LATEST.version}
+          </p>
+          <div className="mt-3 flex flex-col gap-3">
+            {LATEST.items.map((item) => (
+              <div key={item.title}>
+                <p className="text-sm text-[var(--text-secondary,#b9c6da)]">{item.title}</p>
+                <p className="mt-0.5 text-xs leading-relaxed text-[var(--text-meta,#7a8ba3)]">
+                  {item.body}
+                </p>
+              </div>
+            ))}
           </div>
         </div>
 
